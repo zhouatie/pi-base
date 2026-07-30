@@ -8,8 +8,7 @@
 pi-base/
 ├── extensions/
 │   ├── agent-duration/              # TUI 底栏显示 Agent、排队、模型与工具耗时
-│   ├── kitty-tab-status/            # 以标题标记显示 Pi 状态的 Kitty 标签页状态
-│   └── openai-codex-fast-minimal/   # OpenAI Codex Fast 自定义 provider
+│   └── kitty-tab-status/            # 以标题标记显示 Pi 状态的 Kitty 标签页状态
 ├── skills/
 ├── prompts/
 └── themes/

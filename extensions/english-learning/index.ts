@@ -1,6 +1,14 @@
-import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+	getMarkdownTheme,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type InputEvent,
+	type InputEventResult,
+} from "@earendil-works/pi-coding-agent";
 import { Container, Key, Markdown, Text } from "@earendil-works/pi-tui";
-import { translateWithDeepSeek } from "./translator.ts";
+import { inputReviewTarget, normalizeCosmeticEnglish, type InputReviewTarget } from "./input-review.ts";
+import { EnglishReviewComponent, type ReviewAction } from "./review-ui.ts";
+import { reviewEnglishWithDeepSeek, translateWithDeepSeek, type EnglishReview } from "./translator.ts";
 
 const WIDGET_ID = "pi-base.english-learning.translation";
 const STATUS_ID = "pi-base.english-learning.status";
@@ -19,18 +27,6 @@ type CachedTranslation = {
 	assistantEntryId: string;
 	text: string;
 };
-
-function containsChinese(text: string): boolean {
-	return /\p{Script=Han}/u.test(text);
-}
-
-function isCommand(text: string): boolean {
-	const trimmed = text.trimStart();
-	if (trimmed.startsWith("!")) return true;
-
-	const firstLine = trimmed.split(/\r?\n/, 1)[0];
-	return /^\/[A-Za-z0-9][A-Za-z0-9:_-]*(?:\s|$)/.test(firstLine);
-}
 
 function assistantText(message: unknown): string | undefined {
 	if (!message || typeof message !== "object") return undefined;
@@ -86,8 +82,28 @@ export default function englishLearning(pi: ExtensionAPI) {
 	let cachedTranslation: CachedTranslation | undefined;
 	let translationVisible = false;
 	let replyTranslationController: AbortController | undefined;
-	let inputTranslationController: AbortController | undefined;
+	const inputReviewControllers = new Set<AbortController>();
+	let inputReviewTail: Promise<void> = Promise.resolve();
+	let cancelActiveInputDialog: (() => void) | undefined;
+	let inputEditorActive = false;
 	let sessionGeneration = 0;
+
+	function enqueueInputReview<T>(work: () => Promise<T>): Promise<T> {
+		const previous = inputReviewTail;
+		let release!: () => void;
+		inputReviewTail = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		return previous.then(work).finally(release);
+	}
+
+	function cancelInputReviews() {
+		sessionGeneration++;
+		for (const controller of inputReviewControllers) controller.abort();
+		inputReviewControllers.clear();
+		cancelActiveInputDialog?.();
+		cancelActiveInputDialog = undefined;
+	}
 
 	function clearReplyTranslation(ctx: ExtensionContext, clearCache: boolean) {
 		replyTranslationController?.abort();
@@ -103,76 +119,130 @@ export default function englishLearning(pi: ExtensionAPI) {
 	}
 
 	function resetSessionState(ctx: ExtensionContext) {
-		sessionGeneration++;
-		inputTranslationController?.abort();
-		inputTranslationController = undefined;
+		cancelInputReviews();
 		clearReplyTranslation(ctx, true);
 	}
+
+	function prepareForSessionTransition(ctx: ExtensionContext): { cancel: true } | undefined {
+		if (inputEditorActive) {
+			ctx.ui.notify("请先关闭英语编辑界面，再切换会话。", "warning");
+			return { cancel: true };
+		}
+		cancelInputReviews();
+		return undefined;
+	}
+
+	pi.on("session_before_switch", (_event, ctx) => prepareForSessionTransition(ctx));
+	pi.on("session_before_fork", (_event, ctx) => prepareForSessionTransition(ctx));
+	pi.on("session_before_tree", (_event, ctx) => prepareForSessionTransition(ctx));
 
 	pi.on("session_start", (_event, ctx) => {
 		resetSessionState(ctx);
 	});
 
-	pi.on("input", async (event, ctx) => {
-		clearReplyTranslation(ctx, true);
-		if (event.source !== "interactive" || isCommand(event.text) || !containsChinese(event.text)) {
-			return { action: "continue" };
-		}
+	async function processInputReview(
+		event: InputEvent,
+		ctx: ExtensionContext,
+		target: InputReviewTarget,
+		generation: number,
+	): Promise<InputEventResult> {
+		if (generation !== sessionGeneration) return { action: "handled" };
 
 		const original = event.text;
-		const generation = sessionGeneration;
 		const controller = new AbortController();
-		inputTranslationController?.abort();
-		inputTranslationController = controller;
+		inputReviewControllers.add(controller);
 		try {
-			ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("accent", "正在将输入翻译为英文…"));
+			ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("accent", "正在检查并优化英文…"));
 		} catch {}
 
-		let translated: string;
+		let review: EnglishReview;
 		try {
-			translated = await translateWithDeepSeek(original, "zh-en", controller.signal);
+			review = await reviewEnglishWithDeepSeek(target.source, controller.signal);
+		} catch (error) {
+			if (generation !== sessionGeneration || controller.signal.aborted) return { action: "handled" };
+			const reason = error instanceof Error ? error.message : "Unknown DeepSeek error.";
+			ctx.ui.notify(`英语检查失败，将直接发送原文。${reason}`, "warning");
+			return { action: "continue" };
+		} finally {
+			inputReviewControllers.delete(controller);
+			if (inputReviewControllers.size === 0 && generation === sessionGeneration) {
+				try {
+					ctx.ui.setStatus(STATUS_ID, undefined);
+				} catch {}
+			}
+		}
+
+		if (generation !== sessionGeneration) return { action: "handled" };
+		if (normalizeCosmeticEnglish(target.source) === normalizeCosmeticEnglish(review.english)) {
+			return {
+				action: "transform",
+				text: target.rebuild(review.english),
+				images: event.images,
+			};
+		}
+
+		let action: ReviewAction;
+		let closeDialog: (() => void) | undefined;
+		try {
+			action = await ctx.ui.custom<ReviewAction>((_tui, theme, _keybindings, done) => {
+				const component = new EnglishReviewComponent(target.source, review, theme, done);
+				closeDialog = () => component.cancel();
+				cancelActiveInputDialog = closeDialog;
+				return component;
+			});
 		} catch {
 			if (generation === sessionGeneration) {
-				restoreUnsubmittedInput(
-					ctx,
-					original,
-					"输入翻译失败，原文未提交。请检查 DEEPSEEK_API_KEY 或稍后重试。",
-					"error",
-				);
+				restoreUnsubmittedInput(ctx, original, "无法打开英语学习界面，原文未提交。", "error");
 			}
 			return { action: "handled" };
 		} finally {
-			if (inputTranslationController === controller) {
-				inputTranslationController = undefined;
-				if (generation === sessionGeneration) {
-					try {
-						ctx.ui.setStatus(STATUS_ID, undefined);
-					} catch {}
-				}
-			}
-		}
-
-		if (generation !== sessionGeneration) return { action: "handled" };
-		let confirmed: string | undefined;
-		try {
-			confirmed = await ctx.ui.editor("确认发送的英文（可编辑，Esc 取消）", translated);
-		} catch {
-			if (generation === sessionGeneration) {
-				restoreUnsubmittedInput(ctx, original, "无法打开英文确认界面，原文未提交。", "error");
-			}
-			return { action: "handled" };
+			if (cancelActiveInputDialog === closeDialog) cancelActiveInputDialog = undefined;
 		}
 		if (generation !== sessionGeneration) return { action: "handled" };
-		if (!confirmed?.trim()) {
+		if (action === "cancel") {
 			restoreUnsubmittedInput(ctx, original, "已取消，原文未提交。", "info");
 			return { action: "handled" };
 		}
 
+		let confirmed = review.english;
+		if (action === "edit") {
+			let edited: string | undefined;
+			inputEditorActive = true;
+			try {
+				edited = await ctx.ui.editor("编辑发送给 Agent 的英文（Esc 取消）", review.english);
+			} catch {
+				if (generation === sessionGeneration) {
+					restoreUnsubmittedInput(ctx, original, "无法打开英文编辑界面，原文未提交。", "error");
+				}
+				return { action: "handled" };
+			} finally {
+				inputEditorActive = false;
+			}
+			if (generation !== sessionGeneration) return { action: "handled" };
+			if (!edited?.trim()) {
+				restoreUnsubmittedInput(ctx, original, "已取消，原文未提交。", "info");
+				return { action: "handled" };
+			}
+			confirmed = edited;
+		}
+		if (generation !== sessionGeneration) return { action: "handled" };
+
 		return {
 			action: "transform",
-			text: confirmed,
+			text: target.rebuild(confirmed),
 			images: event.images,
 		};
+	}
+
+	pi.on("input", (event, ctx) => {
+		clearReplyTranslation(ctx, true);
+		if (event.source !== "interactive") return { action: "continue" };
+
+		const target = inputReviewTarget(event.text);
+		if (!target) return { action: "continue" };
+
+		const generation = sessionGeneration;
+		return enqueueInputReview(() => processInputReview(event, ctx, target, generation));
 	});
 
 	pi.on("before_agent_start", (event) => ({

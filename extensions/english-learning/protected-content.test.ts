@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { inputReviewTarget } from "./input-review.ts";
 import { collectProtectedContentRanges } from "./protected-content.ts";
-import { reviewEnglishWithDeepSeek } from "./translator.ts";
+import { recommendEnglishWithDeepSeek, reviewEnglishWithDeepSeek } from "./translator.ts";
 
 function quotedValues(source: string): string[] {
 	return collectProtectedContentRanges(source, true)
@@ -49,6 +49,42 @@ test("keeps reviewed task command rebuilding for mixed quoted input", () => {
 			target.rebuild('Fix the error: “用户不存在”'),
 			`/${command} Fix the error: “用户不存在”`,
 		);
+	}
+});
+
+test("live recommendations preserve quotes and technical content", async () => {
+	const originalFetch = globalThis.fetch;
+	const originalApiKey = process.env.DEEPSEEK_PI_TRANSLATE_API_KEY;
+	process.env.DEEPSEEK_PI_TRANSLATE_API_KEY = "test-key";
+	globalThis.fetch = async (_input, init) => {
+		const body = JSON.parse(String(init?.body)) as { input: string };
+		const placeholders = body.input.match(/⟪PI_TRANSLATION_KEEP_\d+⟫/g) ?? [];
+		assert.equal(body.input.includes("用户不存在"), false);
+		assert.equal(placeholders.length, 2);
+		return new Response(
+			JSON.stringify({
+				status: "completed",
+				output: [
+					{
+						type: "message",
+						content: [{ type: "output_text", text: `Fix ${placeholders[0]} in ${placeholders[1]}` }],
+					},
+				],
+			}),
+			{ status: 200, headers: { "Content-Type": "application/json" } },
+		);
+	};
+
+	try {
+		const source = '修复 “用户不存在” in /tmp/file.ts';
+		assert.equal(
+			await recommendEnglishWithDeepSeek(source),
+			'Fix “用户不存在” in /tmp/file.ts',
+		);
+	} finally {
+		globalThis.fetch = originalFetch;
+		if (originalApiKey === undefined) delete process.env.DEEPSEEK_PI_TRANSLATE_API_KEY;
+		else process.env.DEEPSEEK_PI_TRANSLATE_API_KEY = originalApiKey;
 	}
 });
 

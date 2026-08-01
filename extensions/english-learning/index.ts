@@ -1,4 +1,5 @@
 import {
+	CustomEditor,
 	getMarkdownTheme,
 	type ExtensionAPI,
 	type ExtensionContext,
@@ -8,21 +9,37 @@ import {
 import { Container, Key, Markdown, Text } from "@earendil-works/pi-tui";
 import { InputReviewCancellationState } from "./input-review-cancellation.ts";
 import { inputReviewTarget, normalizeCosmeticEnglish, type InputReviewTarget } from "./input-review.ts";
+import {
+	currentLiveRecommendation,
+	LivePreviewController,
+	type LivePreviewState,
+} from "./live-preview.ts";
+import { LivePreviewEditor } from "./live-preview-editor.ts";
+import { LivePreviewComponent } from "./live-preview-ui.ts";
 import { EnglishReviewComponent, type ReviewAction } from "./review-ui.ts";
 import {
-	automaticTranslationEnabled,
 	englishReplySystemPrompt,
+	livePreviewEnabled,
+	nextTranslationMode,
 	parseTranslationModeCommand,
+	submitTimeReviewEnabled,
 	TRANSLATION_MODE_ENTRY_TYPE,
 	translationModeFromEntries,
 	type TranslationMode,
 } from "./translation-mode.ts";
-import { reviewEnglishWithDeepSeek, translateWithDeepSeek, type EnglishReview } from "./translator.ts";
+import {
+	recommendEnglishWithDeepSeek,
+	reviewEnglishWithDeepSeek,
+	translateWithDeepSeek,
+	type EnglishReview,
+} from "./translator.ts";
 
 const WIDGET_ID = "pi-base.english-learning.translation";
+const LIVE_PREVIEW_WIDGET_ID = "pi-base.english-learning.live-preview";
 const STATUS_ID = "pi-base.english-learning.status";
 const MODE_STATUS_ID = "pi-base.english-learning.mode-status";
-const TRANS_COMMAND_USAGE = "Usage: /trans on | off | status";
+const LIVE_PREVIEW_DEBOUNCE_MS = 1_200;
+const TRANS_COMMAND_USAGE = "Usage: /trans off | preview | review | status";
 const ENGLISH_REPLY_INSTRUCTION = [
 	"English learning mode is enabled.",
 	"Reply in clear, natural English by default.",
@@ -39,6 +56,12 @@ type CachedTranslation = {
 	text: string;
 };
 
+type PendingPreviewSend = {
+	original: string;
+	recommended: string;
+	expires: ReturnType<typeof setTimeout>;
+};
+
 function assistantText(message: unknown): string | undefined {
 	if (!message || typeof message !== "object") return undefined;
 	const candidate = message as { role?: unknown; stopReason?: unknown; content?: unknown };
@@ -46,6 +69,22 @@ function assistantText(message: unknown): string | undefined {
 	if (candidate.stopReason !== "stop" && candidate.stopReason !== "length") return undefined;
 	if (!Array.isArray(candidate.content)) return undefined;
 
+	const text = candidate.content
+		.filter((block): block is { type: "text"; text: string } => {
+			if (!block || typeof block !== "object") return false;
+			const value = block as { type?: unknown; text?: unknown };
+			return value.type === "text" && typeof value.text === "string";
+		})
+		.map((block) => block.text)
+		.join("\n")
+		.trim();
+	return text || undefined;
+}
+
+function userText(message: unknown): string | undefined {
+	if (!message || typeof message !== "object") return undefined;
+	const candidate = message as { role?: unknown; content?: unknown };
+	if (candidate.role !== "user" || !Array.isArray(candidate.content)) return undefined;
 	const text = candidate.content
 		.filter((block): block is { type: "text"; text: string } => {
 			if (!block || typeof block !== "object") return false;
@@ -98,7 +137,10 @@ export default function englishLearning(pi: ExtensionAPI) {
 	let cancelActiveInputDialog: (() => void) | undefined;
 	let inputEditorActive = false;
 	const inputReviewCancellation = new InputReviewCancellationState();
-	let translationMode: TranslationMode = "on";
+	let translationMode: TranslationMode = "review";
+	let livePreview: LivePreviewController | undefined;
+	let livePreviewState: LivePreviewState = { status: "hidden" };
+	let pendingPreviewSend: PendingPreviewSend | undefined;
 
 	function enqueueInputReview<T>(work: () => Promise<T>): Promise<T> {
 		const previous = inputReviewTail;
@@ -139,22 +181,98 @@ export default function englishLearning(pi: ExtensionAPI) {
 		} catch {}
 	}
 
-	function resetSessionState(ctx: ExtensionContext) {
-		cancelInputReviews("handled");
-		clearReplyTranslation(ctx, true);
+	function clearLivePreviewUi(ctx: ExtensionContext) {
+		try {
+			ctx.ui.setWidget(LIVE_PREVIEW_WIDGET_ID, undefined);
+		} catch {}
 	}
 
-	function renderTranslationModeStatus(ctx: ExtensionContext) {
+	function renderLivePreview(ctx: ExtensionContext, state: LivePreviewState) {
+		livePreviewState = state;
+		if (state.status === "hidden") {
+			clearLivePreviewUi(ctx);
+			return;
+		}
 		try {
-			ctx.ui.setStatus(
-				MODE_STATUS_ID,
-				translationMode === "off" ? ctx.ui.theme.fg("muted", "Translation: off") : undefined,
+			ctx.ui.setWidget(
+				LIVE_PREVIEW_WIDGET_ID,
+				(_tui, theme) =>
+					new LivePreviewComponent(
+						state.original,
+						state.status === "ready" ? state.recommended : undefined,
+						theme,
+					),
+				{ placement: "belowEditor" },
 			);
 		} catch {}
 	}
 
-	function restoreTranslationMode(ctx: ExtensionContext) {
+	function syncLivePreviewAvailability() {
+		livePreview?.setEnabled(livePreviewEnabled(translationMode));
+	}
+
+	function clearPendingPreviewSend() {
+		if (pendingPreviewSend) clearTimeout(pendingPreviewSend.expires);
+		pendingPreviewSend = undefined;
+	}
+
+	function disposeLivePreview(ctx: ExtensionContext) {
+		livePreview?.dispose();
+		livePreview = undefined;
+		livePreviewState = { status: "hidden" };
+		clearLivePreviewUi(ctx);
+	}
+
+	function setupLivePreview(ctx: ExtensionContext) {
+		if (ctx.mode !== "tui") return;
+
+		const controller = new LivePreviewController({
+			enabled: livePreviewEnabled(translationMode),
+			debounceMs: LIVE_PREVIEW_DEBOUNCE_MS,
+			target: inputReviewTarget,
+			recommend: (source, signal) => recommendEnglishWithDeepSeek(source, signal),
+			onStateChange: (state) => {
+				if (livePreview === controller) renderLivePreview(ctx, state);
+			},
+		});
+		livePreview = controller;
+
+		const previousEditorFactory = ctx.ui.getEditorComponent();
+		ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+			const editor = previousEditorFactory
+				? previousEditorFactory(tui, theme, keybindings)
+				: new CustomEditor(tui, theme, keybindings);
+			return new LivePreviewEditor(editor, (text) => controller.update(text));
+		});
+	}
+
+	function restoreInput(
+		ctx: ExtensionContext,
+		original: string,
+		message: string,
+		level: "info" | "error",
+	) {
+		restoreUnsubmittedInput(ctx, original, message, level);
+		livePreview?.update(original);
+	}
+
+	function resetSessionState(ctx: ExtensionContext) {
+		cancelInputReviews("handled");
+		clearPendingPreviewSend();
+		clearReplyTranslation(ctx, true);
+		disposeLivePreview(ctx);
+	}
+
+	function renderTranslationModeStatus(ctx: ExtensionContext) {
+		try {
+			const color = translationMode === "off" ? "muted" : "accent";
+			ctx.ui.setStatus(MODE_STATUS_ID, ctx.ui.theme.fg(color, `English: ${translationMode}`));
+		} catch {}
+	}
+
+	function restoreMode(ctx: ExtensionContext) {
 		translationMode = translationModeFromEntries(ctx.sessionManager.getBranch());
+		syncLivePreviewAvailability();
 		renderTranslationModeStatus(ctx);
 	}
 
@@ -173,40 +291,98 @@ export default function englishLearning(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		resetSessionState(ctx);
-		restoreTranslationMode(ctx);
+		restoreMode(ctx);
+		setupLivePreview(ctx);
 	});
 
 	pi.on("session_tree", (_event, ctx) => {
-		restoreTranslationMode(ctx);
+		restoreMode(ctx);
+		livePreview?.update(ctx.ui.getEditorText());
 	});
 
+	function setTranslationMode(mode: TranslationMode, ctx: ExtensionContext) {
+		if (mode === translationMode) return;
+		const previousMode = translationMode;
+		translationMode = mode;
+		pi.appendEntry(TRANSLATION_MODE_ENTRY_TYPE, { mode });
+
+		if (previousMode === "review" && mode !== "review" && inputReviewCancellation.hasActive) {
+			cancelInputReviews("continue");
+			try {
+				ctx.ui.setStatus(STATUS_ID, undefined);
+			} catch {}
+		}
+		syncLivePreviewAvailability();
+		renderTranslationModeStatus(ctx);
+	}
+
 	pi.registerCommand("trans", {
-		description: "Enable, disable, or show automatic English translation",
+		description: "Switch or show the English translation mode",
 		handler: async (args, ctx) => {
 			const command = parseTranslationModeCommand(args);
 			if (command === "status") {
-				ctx.ui.notify(`Translation: ${translationMode}`, "info");
+				ctx.ui.notify(`English mode: ${translationMode}`, "info");
 				return;
 			}
 			if (!command) {
-				const prefix = args.trim() ? "" : `Translation: ${translationMode}\n`;
+				const prefix = args.trim() ? "" : `English mode: ${translationMode}\n`;
 				ctx.ui.notify(`${prefix}${TRANS_COMMAND_USAGE}`, args.trim() ? "warning" : "info");
 				return;
 			}
 
-			const modeChanged = command !== translationMode;
-			if (modeChanged) {
-				translationMode = command;
-				pi.appendEntry(TRANSLATION_MODE_ENTRY_TYPE, { mode: translationMode });
+			setTranslationMode(command, ctx);
+			ctx.ui.notify(`English mode: ${translationMode}`, "info");
+		},
+	});
+
+	pi.registerShortcut(Key.ctrlShift("e"), {
+		description: "Cycle the English translation mode",
+		handler: async (ctx) => {
+			setTranslationMode(nextTranslationMode(translationMode), ctx);
+			ctx.ui.notify(`English mode: ${translationMode}`, "info");
+		},
+	});
+
+	pi.registerShortcut("ctrl+enter", {
+		description: "Send the live English recommendation",
+		handler: async (ctx) => {
+			if (translationMode !== "preview") {
+				ctx.ui.notify("Live recommendation sending is available only in preview mode.", "warning");
+				return;
 			}
-			if (modeChanged && translationMode === "off") {
-				cancelInputReviews("continue");
-				try {
-					ctx.ui.setStatus(STATUS_ID, undefined);
-				} catch {}
+
+			if (!ctx.isIdle()) {
+				ctx.ui.notify("Wait for the Agent to finish before sending the recommendation.", "warning");
+				return;
 			}
-			renderTranslationModeStatus(ctx);
-			ctx.ui.notify(`Translation: ${translationMode}`, "info");
+
+			const original = ctx.ui.getEditorText();
+			const recommended = currentLiveRecommendation(livePreviewState, original);
+			if (!recommended) {
+				ctx.ui.notify("The English recommendation is not ready yet.", "warning");
+				return;
+			}
+			if (original.trimStart().startsWith("/")) {
+				ctx.ui.notify("Use Enter to submit commands; recommendation sending supports text prompts only.", "warning");
+				return;
+			}
+
+			clearPendingPreviewSend();
+			const pending: PendingPreviewSend = {
+				original,
+				recommended,
+				expires: setTimeout(() => {
+					if (pendingPreviewSend === pending) pendingPreviewSend = undefined;
+				}, 10_000),
+			};
+			pendingPreviewSend = pending;
+			try {
+				pi.sendUserMessage(recommended);
+			} catch (error) {
+				clearPendingPreviewSend();
+				const reason = error instanceof Error ? ` ${error.message}` : "";
+				ctx.ui.notify(`Unable to send the English recommendation.${reason}`, "error");
+			}
 		},
 	});
 
@@ -278,7 +454,7 @@ export default function englishLearning(pi: ExtensionAPI) {
 			} catch {
 				const canceled = canceledInputReviewResult(generation);
 				if (canceled) return canceled;
-				restoreUnsubmittedInput(ctx, original, "无法打开英语学习界面，原文未提交。", "error");
+				restoreInput(ctx, original, "无法打开英语学习界面，原文未提交。", "error");
 				return { action: "handled" };
 			} finally {
 				if (cancelActiveInputDialog === closeDialog) cancelActiveInputDialog = undefined;
@@ -286,7 +462,7 @@ export default function englishLearning(pi: ExtensionAPI) {
 			const canceledAfterDialog = canceledInputReviewResult(generation);
 			if (canceledAfterDialog) return canceledAfterDialog;
 			if (action === "cancel") {
-				restoreUnsubmittedInput(ctx, original, "已取消，原文未提交。", "info");
+				restoreInput(ctx, original, "已取消，原文未提交。", "info");
 				return { action: "handled" };
 			}
 			if (action === "send-original") return { action: "continue" };
@@ -307,7 +483,7 @@ export default function englishLearning(pi: ExtensionAPI) {
 				} catch {
 					const canceled = canceledInputReviewResult(generation);
 					if (canceled) return canceled;
-					restoreUnsubmittedInput(ctx, original, "无法打开英文编辑界面，原文未提交。", "error");
+					restoreInput(ctx, original, "无法打开英文编辑界面，原文未提交。", "error");
 					return { action: "handled" };
 				} finally {
 					inputEditorActive = false;
@@ -315,7 +491,7 @@ export default function englishLearning(pi: ExtensionAPI) {
 				const canceledAfterEditor = canceledInputReviewResult(generation);
 				if (canceledAfterEditor) return canceledAfterEditor;
 				if (!edited?.trim()) {
-					restoreUnsubmittedInput(ctx, original, "已取消，原文未提交。", "info");
+					restoreInput(ctx, original, "已取消，原文未提交。", "info");
 					return { action: "handled" };
 				}
 				confirmed = edited;
@@ -331,9 +507,16 @@ export default function englishLearning(pi: ExtensionAPI) {
 		}
 	}
 
+	pi.on("message_start", (event, ctx) => {
+		const pending = pendingPreviewSend;
+		if (!pending || userText(event.message) !== pending.recommended) return;
+		clearPendingPreviewSend();
+		if (ctx.ui.getEditorText() === pending.original) ctx.ui.setEditorText("");
+	});
+
 	pi.on("input", (event, ctx) => {
 		clearReplyTranslation(ctx, true);
-		if (event.source !== "interactive" || !automaticTranslationEnabled(translationMode)) {
+		if (event.source !== "interactive" || !submitTimeReviewEnabled(translationMode)) {
 			return { action: "continue" };
 		}
 

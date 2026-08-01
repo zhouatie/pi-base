@@ -3,34 +3,57 @@ import test from "node:test";
 import {
 	automaticTranslationEnabled,
 	englishReplySystemPrompt,
+	livePreviewEnabled,
+	nextTranslationMode,
 	parseTranslationModeCommand,
+	submitTimeReviewEnabled,
 	TRANSLATION_MODE_ENTRY_TYPE,
 	translationModeFromEntries,
 } from "./translation-mode.ts";
 
 test("parses translation mode commands case-insensitively", () => {
-	assert.equal(parseTranslationModeCommand("on"), "on");
-	assert.equal(parseTranslationModeCommand(" OFF "), "off");
+	assert.equal(parseTranslationModeCommand("off"), "off");
+	assert.equal(parseTranslationModeCommand(" PREVIEW "), "preview");
+	assert.equal(parseTranslationModeCommand("Review"), "review");
 	assert.equal(parseTranslationModeCommand("Status"), "status");
 	assert.equal(parseTranslationModeCommand(""), undefined);
-	assert.equal(parseTranslationModeCommand("toggle"), undefined);
+	assert.equal(parseTranslationModeCommand("on"), undefined);
 });
 
 test("restores the latest valid branch-local translation mode", () => {
 	const entries = [
 		{ type: "custom", customType: TRANSLATION_MODE_ENTRY_TYPE, data: { mode: "off" } },
-		{ type: "custom", customType: "other-extension", data: { mode: "on" } },
+		{ type: "custom", customType: "other-extension", data: { mode: "preview" } },
 		{ type: "custom", customType: TRANSLATION_MODE_ENTRY_TYPE, data: { mode: "invalid" } },
-		{ type: "custom", customType: TRANSLATION_MODE_ENTRY_TYPE, data: { mode: "on" } },
+		{ type: "custom", customType: TRANSLATION_MODE_ENTRY_TYPE, data: { mode: "preview" } },
 	];
-	assert.equal(translationModeFromEntries(entries), "on");
+	assert.equal(translationModeFromEntries(entries), "preview");
 	assert.equal(translationModeFromEntries(entries.slice(0, 3)), "off");
-	assert.equal(translationModeFromEntries([]), "on");
+	assert.equal(translationModeFromEntries([]), "review");
 });
 
-test("off disables both automatic input processing and English prompt injection", () => {
+test("cycles through off, preview, and review modes", () => {
+	assert.equal(nextTranslationMode("off"), "preview");
+	assert.equal(nextTranslationMode("preview"), "review");
+	assert.equal(nextTranslationMode("review"), "off");
+});
+
+test("each mode enables only its intended automatic behavior", () => {
 	assert.equal(automaticTranslationEnabled("off"), false);
+	assert.equal(livePreviewEnabled("off"), false);
+	assert.equal(submitTimeReviewEnabled("off"), false);
+
+	assert.equal(automaticTranslationEnabled("preview"), true);
+	assert.equal(livePreviewEnabled("preview"), true);
+	assert.equal(submitTimeReviewEnabled("preview"), false);
+
+	assert.equal(automaticTranslationEnabled("review"), true);
+	assert.equal(livePreviewEnabled("review"), false);
+	assert.equal(submitTimeReviewEnabled("review"), true);
+});
+
+test("off disables English prompt injection", () => {
 	assert.equal(englishReplySystemPrompt("base", "instruction", "off"), undefined);
-	assert.equal(automaticTranslationEnabled("on"), true);
-	assert.equal(englishReplySystemPrompt("base", "instruction", "on"), "base\n\ninstruction");
+	assert.equal(englishReplySystemPrompt("base", "instruction", "preview"), "base\n\ninstruction");
+	assert.equal(englishReplySystemPrompt("base", "instruction", "review"), "base\n\ninstruction");
 });

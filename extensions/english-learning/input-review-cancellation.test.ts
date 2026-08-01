@@ -44,9 +44,12 @@ test("a later session cancellation overrides pending passthrough outcomes", () =
 	state.release(currentSession);
 });
 
-test("uncanceled current-generation work remains active", () => {
+test("tracks whether input review work is active", () => {
 	const state = new InputReviewCancellationState();
+	assert.equal(state.hasActive, false);
 	const generation = state.capture();
+	assert.equal(state.hasActive, true);
 	assert.equal(state.outcome(generation), "active");
 	state.release(generation);
+	assert.equal(state.hasActive, false);
 });

@@ -4,7 +4,7 @@ import type { EnglishReview } from "./translator.ts";
 
 export type ReviewAction = "send" | "send-original" | "review-all" | "edit" | "cancel";
 
-type HighlightedReviewDiff = {
+export type HighlightedReviewDiff = {
 	original: string;
 	recommended: string;
 	hasChanges: boolean;
@@ -19,7 +19,7 @@ function tokenizeReviewText(text: string): string[] {
 	return text.match(/\s+|[\p{L}\p{N}_]+(?:['’-][\p{L}\p{N}_]+)*|[^\s]/gu) ?? [];
 }
 
-function highlightReviewDiff(original: string, recommended: string, theme: Theme): HighlightedReviewDiff {
+export function highlightReviewDiff(original: string, recommended: string, theme: Theme): HighlightedReviewDiff {
 	if (original === recommended) {
 		return {
 			original: theme.fg("text", original),

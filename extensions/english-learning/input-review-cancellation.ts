@@ -9,6 +9,10 @@ export class InputReviewCancellationState {
 		return this.currentGeneration;
 	}
 
+	get hasActive(): boolean {
+		return this.activeCounts.size > 0;
+	}
+
 	capture(): number {
 		const generation = this.currentGeneration;
 		this.activeCounts.set(generation, (this.activeCounts.get(generation) ?? 0) + 1);

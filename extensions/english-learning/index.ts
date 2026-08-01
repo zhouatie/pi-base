@@ -18,6 +18,7 @@ import { LivePreviewEditor } from "./live-preview-editor.ts";
 import { LivePreviewComponent } from "./live-preview-ui.ts";
 import { EnglishReviewComponent, type ReviewAction } from "./review-ui.ts";
 import {
+	DEFAULT_TRANSLATION_MODE,
 	englishReplySystemPrompt,
 	livePreviewEnabled,
 	nextTranslationMode,
@@ -137,7 +138,7 @@ export default function englishLearning(pi: ExtensionAPI) {
 	let cancelActiveInputDialog: (() => void) | undefined;
 	let inputEditorActive = false;
 	const inputReviewCancellation = new InputReviewCancellationState();
-	let translationMode: TranslationMode = "review";
+	let translationMode: TranslationMode = DEFAULT_TRANSLATION_MODE;
 	let livePreview: LivePreviewController | undefined;
 	let livePreviewState: LivePreviewState = { status: "hidden" };
 	let pendingPreviewSend: PendingPreviewSend | undefined;

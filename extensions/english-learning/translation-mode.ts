@@ -3,6 +3,7 @@ export const TRANSLATION_MODE_ENTRY_TYPE = "pi-base.english-learning.translation
 export type TranslationMode = "off" | "preview" | "review";
 export type TranslationModeCommand = TranslationMode | "status";
 
+export const DEFAULT_TRANSLATION_MODE: TranslationMode = "preview";
 const TRANSLATION_MODES: readonly TranslationMode[] = ["off", "preview", "review"];
 
 export function parseTranslationModeCommand(args: string): TranslationModeCommand | undefined {
@@ -23,7 +24,7 @@ export function translationModeFromEntries(entries: readonly unknown[]): Transla
 		const mode = (candidate.data as { mode?: unknown }).mode;
 		if (mode === "off" || mode === "preview" || mode === "review") return mode;
 	}
-	return "review";
+	return DEFAULT_TRANSLATION_MODE;
 }
 
 export function nextTranslationMode(mode: TranslationMode): TranslationMode {

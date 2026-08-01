@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	automaticTranslationEnabled,
+	DEFAULT_TRANSLATION_MODE,
 	englishReplySystemPrompt,
 	livePreviewEnabled,
 	nextTranslationMode,
@@ -29,7 +30,8 @@ test("restores the latest valid branch-local translation mode", () => {
 	];
 	assert.equal(translationModeFromEntries(entries), "preview");
 	assert.equal(translationModeFromEntries(entries.slice(0, 3)), "off");
-	assert.equal(translationModeFromEntries([]), "review");
+	assert.equal(DEFAULT_TRANSLATION_MODE, "preview");
+	assert.equal(translationModeFromEntries([]), "preview");
 });
 
 test("cycles through off, preview, and review modes", () => {

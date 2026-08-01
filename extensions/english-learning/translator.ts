@@ -1,5 +1,7 @@
-const DEEPSEEK_ENDPOINT = "https://api.deepseek.com/chat/completions";
-const DEEPSEEK_MODEL = "deepseek-chat";
+import { collectProtectedContentRanges } from "./protected-content.ts";
+
+const DEEPSEEK_ENDPOINT = "https://api.deepseek.com/responses";
+const DEEPSEEK_MODEL = "deepseek-v4-flash";
 const REQUEST_TIMEOUT_MS = 60_000;
 const PLACEHOLDER_PREFIX = "⟪PI_TRANSLATION_KEEP_";
 const PLACEHOLDER_PATTERN = /⟪PI_TRANSLATION_KEEP_\d+⟫/g;
@@ -10,65 +12,21 @@ export type EnglishReview = {
 	english: string;
 	corrections: string[];
 	vocabulary: string[];
-};
-
-type ProtectedRange = {
-	start: number;
-	end: number;
-	value: string;
+	preservedQuotedContent: boolean;
 };
 
 type ProtectedText = {
 	text: string;
 	segments: Array<{ placeholder: string; value: string }>;
+	preservedQuotedContent: boolean;
 };
 
-const PROTECTED_PATTERNS = [
-	/```[\s\S]*?(?:```|$)/g,
-	/~~~[\s\S]*?(?:~~~|$)/g,
-	/(`+)[^\r\n]*?\1/g,
-	/https?:\/\/[^\s<>"']+/g,
-	/(?:\/|\.\.?\/|~\/)[^\r\n<>]*?\.(?:png|jpe?g|gif|webp|bmp)(?=\s|$|["'”’)\]}】》」』,，。；;:：])/gi,
-	/[A-Za-z]:\\[^\r\n<>]*?\.(?:png|jpe?g|gif|webp|bmp)(?=\s|$|["'”’)\]}】》」』,，。；;:：])/gi,
-	/(?:\/|\.\.?\/|~\/)[A-Za-z0-9._@%+,\-=/]+/g,
-	/[A-Za-z]:\\(?:[^\s<>:"|?*]+\\)*[^\s<>:"|?*]*/g,
-	/^[ \t]*\$[ \t]+[^\r\n]+/gm,
-	/--?[A-Za-z0-9][A-Za-z0-9-]*/g,
-	/\b[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+\b/g,
-	/\b[A-Za-z]+(?:[A-Z][A-Za-z0-9]*)+\b/g,
-];
-
-function collectProtectedRanges(source: string): ProtectedRange[] {
-	const ranges: ProtectedRange[] = [];
-
-	for (const pattern of PROTECTED_PATTERNS) {
-		pattern.lastIndex = 0;
-		for (const match of source.matchAll(pattern)) {
-			if (match.index === undefined || match[0].length === 0) continue;
-			ranges.push({
-				start: match.index,
-				end: match.index + match[0].length,
-				value: match[0],
-			});
-		}
-	}
-
-	ranges.sort((a, b) => a.start - b.start || b.end - a.end);
-	const nonOverlapping: ProtectedRange[] = [];
-	for (const range of ranges) {
-		const previous = nonOverlapping[nonOverlapping.length - 1];
-		if (previous && range.start < previous.end) continue;
-		nonOverlapping.push(range);
-	}
-	return nonOverlapping;
-}
-
-function protectText(source: string): ProtectedText {
+function protectText(source: string, preserveQuotedContent = false): ProtectedText {
 	if (source.includes(PLACEHOLDER_PREFIX)) {
 		throw new Error("Source contains a reserved translation placeholder.");
 	}
 
-	const ranges = collectProtectedRanges(source);
+	const ranges = collectProtectedContentRanges(source, preserveQuotedContent);
 	const segments: ProtectedText["segments"] = [];
 	let cursor = 0;
 	let text = "";
@@ -81,7 +39,11 @@ function protectText(source: string): ProtectedText {
 	}
 	text += source.slice(cursor);
 
-	return { text, segments };
+	return {
+		text,
+		segments,
+		preservedQuotedContent: ranges.some((range) => range.kind === "quote"),
+	};
 }
 
 function countOccurrences(text: string, value: string): number {
@@ -144,17 +106,27 @@ function reviewInstruction(): string {
 	].join(" ");
 }
 
-function readCompletionResult(payload: unknown): { content: string; finishReason: string } | undefined {
+function readResponseResult(payload: unknown): { content: string; status: string } | undefined {
 	if (!payload || typeof payload !== "object") return undefined;
-	const choices = (payload as { choices?: unknown }).choices;
-	if (!Array.isArray(choices)) return undefined;
-	const first = choices[0];
-	if (!first || typeof first !== "object") return undefined;
-	const choice = first as { finish_reason?: unknown; message?: unknown };
-	if (typeof choice.finish_reason !== "string") return undefined;
-	if (!choice.message || typeof choice.message !== "object") return undefined;
-	const content = (choice.message as { content?: unknown }).content;
-	return typeof content === "string" ? { content, finishReason: choice.finish_reason } : undefined;
+	const response = payload as { status?: unknown; output?: unknown };
+	if (typeof response.status !== "string" || !Array.isArray(response.output)) return undefined;
+
+	const content = response.output
+		.filter((item): item is { type: "message"; content: unknown[] } => {
+			if (!item || typeof item !== "object") return false;
+			const candidate = item as { type?: unknown; content?: unknown };
+			return candidate.type === "message" && Array.isArray(candidate.content);
+		})
+		.flatMap((item) => item.content)
+		.filter((part): part is { type: "output_text"; text: string } => {
+			if (!part || typeof part !== "object") return false;
+			const candidate = part as { type?: unknown; text?: unknown };
+			return candidate.type === "output_text" && typeof candidate.text === "string";
+		})
+		.map((part) => part.text)
+		.join("\n");
+
+	return { content, status: response.status };
 }
 
 async function completeWithDeepSeek(
@@ -163,8 +135,8 @@ async function completeWithDeepSeek(
 	signal: AbortSignal | undefined,
 	jsonOutput: boolean,
 ): Promise<string> {
-	const apiKey = process.env.DEEPSEEK_API_KEY;
-	if (!apiKey) throw new Error("DEEPSEEK_API_KEY is not configured.");
+	const apiKey = process.env.DEEPSEEK_PI_TRANSLATE_API_KEY;
+	if (!apiKey) throw new Error("DEEPSEEK_PI_TRANSLATE_API_KEY is not configured.");
 
 	const controller = new AbortController();
 	const abort = () => controller.abort();
@@ -181,13 +153,12 @@ async function completeWithDeepSeek(
 			},
 			body: JSON.stringify({
 				model: DEEPSEEK_MODEL,
+				instructions: systemPrompt,
+				input: userContent,
+				reasoning: { effort: "none" },
 				temperature: 0,
 				stream: false,
-				...(jsonOutput ? { response_format: { type: "json_object" } } : {}),
-				messages: [
-					{ role: "system", content: systemPrompt },
-					{ role: "user", content: userContent },
-				],
+				...(jsonOutput ? { text: { format: { type: "json_object" } } } : {}),
 			}),
 			signal: controller.signal,
 		});
@@ -196,9 +167,10 @@ async function completeWithDeepSeek(
 			throw new Error(`DeepSeek request failed with status ${response.status}.`);
 		}
 
-		const result = readCompletionResult(await response.json());
-		if (!result?.content.trim()) throw new Error("DeepSeek returned an empty result.");
-		if (result.finishReason !== "stop") throw new Error("DeepSeek returned an incomplete result.");
+		const result = readResponseResult(await response.json());
+		if (!result) throw new Error("DeepSeek returned an invalid response.");
+		if (result.status !== "completed") throw new Error("DeepSeek returned an incomplete result.");
+		if (!result.content.trim()) throw new Error("DeepSeek returned an empty result.");
 		return result.content.trim();
 	} finally {
 		clearTimeout(timeout);
@@ -284,6 +256,7 @@ function parseEnglishReview(content: string, protectedText: ProtectedText): Engl
 		english: restoreProtectedText(candidate.english.trim(), protectedText),
 		corrections,
 		vocabulary,
+		preservedQuotedContent: protectedText.preservedQuotedContent,
 	};
 }
 
@@ -302,8 +275,12 @@ export async function translateWithDeepSeek(
 	return restoreProtectedText(content, protectedText);
 }
 
-export async function reviewEnglishWithDeepSeek(source: string, signal?: AbortSignal): Promise<EnglishReview> {
-	const protectedText = protectText(source);
+export async function reviewEnglishWithDeepSeek(
+	source: string,
+	signal?: AbortSignal,
+	preserveQuotedContent = true,
+): Promise<EnglishReview> {
+	const protectedText = protectText(source, preserveQuotedContent);
 	const content = await completeWithDeepSeek(reviewInstruction(), protectedText.text, signal, true);
 	return parseEnglishReview(content, protectedText);
 }

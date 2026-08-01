@@ -6,12 +6,23 @@ import {
 	type InputEventResult,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Key, Markdown, Text } from "@earendil-works/pi-tui";
+import { InputReviewCancellationState } from "./input-review-cancellation.ts";
 import { inputReviewTarget, normalizeCosmeticEnglish, type InputReviewTarget } from "./input-review.ts";
 import { EnglishReviewComponent, type ReviewAction } from "./review-ui.ts";
+import {
+	automaticTranslationEnabled,
+	englishReplySystemPrompt,
+	parseTranslationModeCommand,
+	TRANSLATION_MODE_ENTRY_TYPE,
+	translationModeFromEntries,
+	type TranslationMode,
+} from "./translation-mode.ts";
 import { reviewEnglishWithDeepSeek, translateWithDeepSeek, type EnglishReview } from "./translator.ts";
 
 const WIDGET_ID = "pi-base.english-learning.translation";
 const STATUS_ID = "pi-base.english-learning.status";
+const MODE_STATUS_ID = "pi-base.english-learning.mode-status";
+const TRANS_COMMAND_USAGE = "Usage: /trans on | off | status";
 const ENGLISH_REPLY_INSTRUCTION = [
 	"English learning mode is enabled.",
 	"Reply in clear, natural English by default.",
@@ -86,7 +97,8 @@ export default function englishLearning(pi: ExtensionAPI) {
 	let inputReviewTail: Promise<void> = Promise.resolve();
 	let cancelActiveInputDialog: (() => void) | undefined;
 	let inputEditorActive = false;
-	let sessionGeneration = 0;
+	const inputReviewCancellation = new InputReviewCancellationState();
+	let translationMode: TranslationMode = "on";
 
 	function enqueueInputReview<T>(work: () => Promise<T>): Promise<T> {
 		const previous = inputReviewTail;
@@ -97,12 +109,21 @@ export default function englishLearning(pi: ExtensionAPI) {
 		return previous.then(work).finally(release);
 	}
 
-	function cancelInputReviews() {
-		sessionGeneration++;
+	function cancelInputReviews(action: "continue" | "handled") {
+		inputReviewCancellation.cancel(action);
 		for (const controller of inputReviewControllers) controller.abort();
 		inputReviewControllers.clear();
 		cancelActiveInputDialog?.();
 		cancelActiveInputDialog = undefined;
+	}
+
+	function canceledInputReviewResult(generation: number): InputEventResult | undefined {
+		const outcome = inputReviewCancellation.outcome(generation);
+		return outcome === "active" ? undefined : { action: outcome };
+	}
+
+	function abortedInputReviewResult(generation: number): InputEventResult {
+		return canceledInputReviewResult(generation) ?? { action: "handled" };
 	}
 
 	function clearReplyTranslation(ctx: ExtensionContext, clearCache: boolean) {
@@ -119,8 +140,22 @@ export default function englishLearning(pi: ExtensionAPI) {
 	}
 
 	function resetSessionState(ctx: ExtensionContext) {
-		cancelInputReviews();
+		cancelInputReviews("handled");
 		clearReplyTranslation(ctx, true);
+	}
+
+	function renderTranslationModeStatus(ctx: ExtensionContext) {
+		try {
+			ctx.ui.setStatus(
+				MODE_STATUS_ID,
+				translationMode === "off" ? ctx.ui.theme.fg("muted", "Translation: off") : undefined,
+			);
+		} catch {}
+	}
+
+	function restoreTranslationMode(ctx: ExtensionContext) {
+		translationMode = translationModeFromEntries(ctx.sessionManager.getBranch());
+		renderTranslationModeStatus(ctx);
 	}
 
 	function prepareForSessionTransition(ctx: ExtensionContext): { cancel: true } | undefined {
@@ -128,7 +163,7 @@ export default function englishLearning(pi: ExtensionAPI) {
 			ctx.ui.notify("请先关闭英语编辑界面，再切换会话。", "warning");
 			return { cancel: true };
 		}
-		cancelInputReviews();
+		cancelInputReviews("handled");
 		return undefined;
 	}
 
@@ -138,6 +173,41 @@ export default function englishLearning(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		resetSessionState(ctx);
+		restoreTranslationMode(ctx);
+	});
+
+	pi.on("session_tree", (_event, ctx) => {
+		restoreTranslationMode(ctx);
+	});
+
+	pi.registerCommand("trans", {
+		description: "Enable, disable, or show automatic English translation",
+		handler: async (args, ctx) => {
+			const command = parseTranslationModeCommand(args);
+			if (command === "status") {
+				ctx.ui.notify(`Translation: ${translationMode}`, "info");
+				return;
+			}
+			if (!command) {
+				const prefix = args.trim() ? "" : `Translation: ${translationMode}\n`;
+				ctx.ui.notify(`${prefix}${TRANS_COMMAND_USAGE}`, args.trim() ? "warning" : "info");
+				return;
+			}
+
+			const modeChanged = command !== translationMode;
+			if (modeChanged) {
+				translationMode = command;
+				pi.appendEntry(TRANSLATION_MODE_ENTRY_TYPE, { mode: translationMode });
+			}
+			if (modeChanged && translationMode === "off") {
+				cancelInputReviews("continue");
+				try {
+					ctx.ui.setStatus(STATUS_ID, undefined);
+				} catch {}
+			}
+			renderTranslationModeStatus(ctx);
+			ctx.ui.notify(`Translation: ${translationMode}`, "info");
+		},
 	});
 
 	async function processInputReview(
@@ -146,34 +216,48 @@ export default function englishLearning(pi: ExtensionAPI) {
 		target: InputReviewTarget,
 		generation: number,
 	): Promise<InputEventResult> {
-		if (generation !== sessionGeneration) return { action: "handled" };
+		const canceledBeforeStart = canceledInputReviewResult(generation);
+		if (canceledBeforeStart) return canceledBeforeStart;
 
 		const original = event.text;
-		const controller = new AbortController();
-		inputReviewControllers.add(controller);
-		try {
-			ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("accent", "正在检查并优化英文…"));
-		} catch {}
+		const requestReview = async (
+			preserveQuotedContent: boolean,
+			statusMessage: string,
+		): Promise<EnglishReview | "aborted" | "failed"> => {
+			const controller = new AbortController();
+			inputReviewControllers.add(controller);
+			try {
+				ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("accent", statusMessage));
+			} catch {}
 
-		let review: EnglishReview;
-		try {
-			review = await reviewEnglishWithDeepSeek(target.source, controller.signal);
-		} catch (error) {
-			if (generation !== sessionGeneration || controller.signal.aborted) return { action: "handled" };
-			const reason = error instanceof Error ? error.message : "Unknown DeepSeek error.";
-			ctx.ui.notify(`英语检查失败，将直接发送原文。${reason}`, "warning");
-			return { action: "continue" };
-		} finally {
-			inputReviewControllers.delete(controller);
-			if (inputReviewControllers.size === 0 && generation === sessionGeneration) {
-				try {
-					ctx.ui.setStatus(STATUS_ID, undefined);
-				} catch {}
+			try {
+				const review = await reviewEnglishWithDeepSeek(target.source, controller.signal, preserveQuotedContent);
+				if (canceledInputReviewResult(generation) || controller.signal.aborted) return "aborted";
+				return review;
+			} catch (error) {
+				if (canceledInputReviewResult(generation) || controller.signal.aborted) return "aborted";
+				const reason = error instanceof Error ? error.message : "Unknown DeepSeek error.";
+				ctx.ui.notify(`英语检查失败，将直接发送原文。${reason}`, "warning");
+				return "failed";
+			} finally {
+				inputReviewControllers.delete(controller);
+				if (inputReviewControllers.size === 0 && !canceledInputReviewResult(generation)) {
+					try {
+						ctx.ui.setStatus(STATUS_ID, undefined);
+					} catch {}
+				}
 			}
-		}
+		};
 
-		if (generation !== sessionGeneration) return { action: "handled" };
-		if (normalizeCosmeticEnglish(target.source) === normalizeCosmeticEnglish(review.english)) {
+		const initialReview = await requestReview(true, "正在检查并优化英文…");
+		if (initialReview === "aborted") return abortedInputReviewResult(generation);
+		if (initialReview === "failed") return { action: "continue" };
+		let review = initialReview;
+
+		if (
+			!review.preservedQuotedContent &&
+			normalizeCosmeticEnglish(target.source) === normalizeCosmeticEnglish(review.english)
+		) {
 			return {
 				action: "transform",
 				text: target.rebuild(review.english),
@@ -181,73 +265,95 @@ export default function englishLearning(pi: ExtensionAPI) {
 			};
 		}
 
-		let action: ReviewAction;
-		let closeDialog: (() => void) | undefined;
-		try {
-			action = await ctx.ui.custom<ReviewAction>((_tui, theme, _keybindings, done) => {
-				const component = new EnglishReviewComponent(target.source, review, theme, done);
-				closeDialog = () => component.cancel();
-				cancelActiveInputDialog = closeDialog;
-				return component;
-			});
-		} catch {
-			if (generation === sessionGeneration) {
-				restoreUnsubmittedInput(ctx, original, "无法打开英语学习界面，原文未提交。", "error");
-			}
-			return { action: "handled" };
-		} finally {
-			if (cancelActiveInputDialog === closeDialog) cancelActiveInputDialog = undefined;
-		}
-		if (generation !== sessionGeneration) return { action: "handled" };
-		if (action === "cancel") {
-			restoreUnsubmittedInput(ctx, original, "已取消，原文未提交。", "info");
-			return { action: "handled" };
-		}
-
-		let confirmed = review.english;
-		if (action === "edit") {
-			let edited: string | undefined;
-			inputEditorActive = true;
+		while (true) {
+			let action: ReviewAction;
+			let closeDialog: (() => void) | undefined;
 			try {
-				edited = await ctx.ui.editor("编辑发送给 Agent 的英文（Esc 取消）", review.english);
+				action = await ctx.ui.custom<ReviewAction>((_tui, theme, _keybindings, done) => {
+					const component = new EnglishReviewComponent(target.source, review, theme, done);
+					closeDialog = () => component.cancel();
+					cancelActiveInputDialog = closeDialog;
+					return component;
+				});
 			} catch {
-				if (generation === sessionGeneration) {
-					restoreUnsubmittedInput(ctx, original, "无法打开英文编辑界面，原文未提交。", "error");
-				}
+				const canceled = canceledInputReviewResult(generation);
+				if (canceled) return canceled;
+				restoreUnsubmittedInput(ctx, original, "无法打开英语学习界面，原文未提交。", "error");
 				return { action: "handled" };
 			} finally {
-				inputEditorActive = false;
+				if (cancelActiveInputDialog === closeDialog) cancelActiveInputDialog = undefined;
 			}
-			if (generation !== sessionGeneration) return { action: "handled" };
-			if (!edited?.trim()) {
+			const canceledAfterDialog = canceledInputReviewResult(generation);
+			if (canceledAfterDialog) return canceledAfterDialog;
+			if (action === "cancel") {
 				restoreUnsubmittedInput(ctx, original, "已取消，原文未提交。", "info");
 				return { action: "handled" };
 			}
-			confirmed = edited;
-		}
-		if (generation !== sessionGeneration) return { action: "handled" };
+			if (action === "send-original") return { action: "continue" };
+			if (action === "review-all") {
+				const fullReview = await requestReview(false, "正在检查全部内容…");
+				if (fullReview === "aborted") return abortedInputReviewResult(generation);
+				if (fullReview === "failed") return { action: "continue" };
+				review = fullReview;
+				continue;
+			}
 
-		return {
-			action: "transform",
-			text: target.rebuild(confirmed),
-			images: event.images,
-		};
+			let confirmed = review.english;
+			if (action === "edit") {
+				let edited: string | undefined;
+				inputEditorActive = true;
+				try {
+					edited = await ctx.ui.editor("编辑发送给 Agent 的英文（Esc 取消）", review.english);
+				} catch {
+					const canceled = canceledInputReviewResult(generation);
+					if (canceled) return canceled;
+					restoreUnsubmittedInput(ctx, original, "无法打开英文编辑界面，原文未提交。", "error");
+					return { action: "handled" };
+				} finally {
+					inputEditorActive = false;
+				}
+				const canceledAfterEditor = canceledInputReviewResult(generation);
+				if (canceledAfterEditor) return canceledAfterEditor;
+				if (!edited?.trim()) {
+					restoreUnsubmittedInput(ctx, original, "已取消，原文未提交。", "info");
+					return { action: "handled" };
+				}
+				confirmed = edited;
+			}
+			const canceledBeforeSubmit = canceledInputReviewResult(generation);
+			if (canceledBeforeSubmit) return canceledBeforeSubmit;
+
+			return {
+				action: "transform",
+				text: target.rebuild(confirmed),
+				images: event.images,
+			};
+		}
 	}
 
 	pi.on("input", (event, ctx) => {
 		clearReplyTranslation(ctx, true);
-		if (event.source !== "interactive") return { action: "continue" };
+		if (event.source !== "interactive" || !automaticTranslationEnabled(translationMode)) {
+			return { action: "continue" };
+		}
 
 		const target = inputReviewTarget(event.text);
 		if (!target) return { action: "continue" };
 
-		const generation = sessionGeneration;
-		return enqueueInputReview(() => processInputReview(event, ctx, target, generation));
+		const generation = inputReviewCancellation.capture();
+		return enqueueInputReview(() => processInputReview(event, ctx, target, generation)).finally(() => {
+			inputReviewCancellation.release(generation);
+		});
 	});
 
-	pi.on("before_agent_start", (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n${ENGLISH_REPLY_INSTRUCTION}`,
-	}));
+	pi.on("before_agent_start", (event) => {
+		const systemPrompt = englishReplySystemPrompt(
+			event.systemPrompt,
+			ENGLISH_REPLY_INSTRUCTION,
+			translationMode,
+		);
+		return systemPrompt === undefined ? undefined : { systemPrompt };
+	});
 
 	pi.on("agent_start", (_event, ctx) => {
 		clearReplyTranslation(ctx, true);
@@ -281,12 +387,16 @@ export default function englishLearning(pi: ExtensionAPI) {
 			replyTranslationController?.abort();
 			const controller = new AbortController();
 			replyTranslationController = controller;
-			const generation = sessionGeneration;
+			const generation = inputReviewCancellation.generation;
 			ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg("accent", "正在翻译最新回复…"));
 
 			try {
 				const translated = await translateWithDeepSeek(assistant.text, "en-zh", controller.signal);
-				if (generation !== sessionGeneration || controller.signal.aborted || !ctx.isIdle()) return;
+				if (
+					generation !== inputReviewCancellation.generation ||
+					controller.signal.aborted ||
+					!ctx.isIdle()
+				) return;
 
 				const current = latestAssistant(ctx);
 				if (!current || current.entryId !== assistant.entryId) return;
@@ -298,13 +408,13 @@ export default function englishLearning(pi: ExtensionAPI) {
 				renderTranslationWidget(ctx, translated);
 				translationVisible = true;
 			} catch {
-				if (generation === sessionGeneration && !controller.signal.aborted) {
-					ctx.ui.notify("回复翻译失败。请检查 DEEPSEEK_API_KEY 或稍后重试。", "error");
+				if (generation === inputReviewCancellation.generation && !controller.signal.aborted) {
+					ctx.ui.notify("回复翻译失败。请检查 DEEPSEEK_PI_TRANSLATE_API_KEY 或稍后重试。", "error");
 				}
 			} finally {
 				if (replyTranslationController === controller) {
 					replyTranslationController = undefined;
-					if (generation === sessionGeneration) ctx.ui.setStatus(STATUS_ID, undefined);
+					if (generation === inputReviewCancellation.generation) ctx.ui.setStatus(STATUS_ID, undefined);
 				}
 			}
 		},
@@ -312,5 +422,8 @@ export default function englishLearning(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", (_event, ctx) => {
 		resetSessionState(ctx);
+		try {
+			ctx.ui.setStatus(MODE_STATUS_ID, undefined);
+		} catch {}
 	});
 }

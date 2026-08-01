@@ -1,3 +1,5 @@
+import { textOutsideProtectedContent } from "./protected-content.ts";
+
 const REVIEWED_TASK_COMMANDS = new Set(["worker", "oracle", "hermes"]);
 const RESOURCE_TOKEN_PATTERN = /(?:\/|\.\.?\/|~\/)[^\r\n<>]*?\.(?:png|jpe?g|gif|webp|bmp)(?=\s|$|["'”’)\]}】》」』,，。；;:：])|[A-Za-z]:\\[^\r\n<>]*?\.(?:png|jpe?g|gif|webp|bmp)(?=\s|$|["'”’)\]}】》」』,，。；;:：])|https?:\/\/[^\s<>"']+|(?:\/|\.\.?\/|~\/)\S+|[A-Za-z]:\\\S+|\s+|[\p{L}\p{N}_]+(?:['’-][\p{L}\p{N}_]+)*|[^\s]/giu;
 const STANDALONE_RESOURCE_PATTERN = /^(?:["'“‘])?(?:https?:\/\/[^\s<>"'，。；：！？\p{Script=Han}]+|(?:\/|\.\.?\/|~\/)[A-Za-z0-9._@%+,\-=/]+|[A-Za-z]:\\[A-Za-z0-9._@%+,\-=\\]+|(?:\/|\.\.?\/|~\/)[^\r\n<>]*\.(?:png|jpe?g|gif|webp|bmp)|[A-Za-z]:\\[^\r\n<>]*\.(?:png|jpe?g|gif|webp|bmp))(?:["'”’])?[.!?。！？]?$/iu;
@@ -12,7 +14,7 @@ function hasReviewableContent(text: string): boolean {
 	if (!trimmed) return false;
 	if (STANDALONE_RESOURCE_PATTERN.test(trimmed)) return false;
 	if (/^(?:```[\s\S]*```|~~~[\s\S]*~~~|`[^\r\n]+`)$/.test(trimmed)) return false;
-	return /[A-Za-z]|\p{Script=Han}/u.test(trimmed);
+	return /[A-Za-z]|\p{Script=Han}/u.test(textOutsideProtectedContent(trimmed, true));
 }
 
 export function normalizeCosmeticEnglish(text: string): string {

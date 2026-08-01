@@ -2,7 +2,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { EnglishReview } from "./translator.ts";
 
-export type ReviewAction = "send" | "edit" | "cancel";
+export type ReviewAction = "send" | "send-original" | "review-all" | "edit" | "cancel";
 
 type HighlightedReviewDiff = {
 	original: string;
@@ -140,6 +140,10 @@ export class EnglishReviewComponent {
 	handleInput(data: string): void {
 		if (matchesKey(data, Key.enter)) {
 			this.finish("send");
+		} else if (matchesKey(data, "o")) {
+			this.finish("send-original");
+		} else if (this.review.preservedQuotedContent && matchesKey(data, "a")) {
+			this.finish("review-all");
 		} else if (matchesKey(data, "e")) {
 			this.finish("edit");
 		} else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
@@ -227,7 +231,10 @@ export class EnglishReviewComponent {
 			for (const note of this.review.vocabulary) addVocabulary(note);
 		}
 		lines.push(row());
-		const footer = row(` ${this.theme.fg("dim", "Enter send  ·  E edit  ·  Esc cancel")}`);
+		const reviewAllHint = this.review.preservedQuotedContent ? "  ·  A review all" : "";
+		const footer = row(
+			` ${this.theme.fg("dim", `Enter send  ·  O original${reviewAllHint}  ·  E edit  ·  Esc cancel`)}`,
+		);
 		const bottomBorder = border(`╰${"─".repeat(innerWidth)}╯`);
 		if (lines.length > MAX_REVIEW_ROWS - 2) {
 			lines.length = MAX_REVIEW_ROWS - 3;

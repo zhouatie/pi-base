@@ -203,7 +203,7 @@ export default function englishLearning(pi: ExtensionAPI) {
 						state.status === "ready" ? state.recommended : undefined,
 						theme,
 					),
-				{ placement: "belowEditor" },
+				{ placement: "aboveEditor" },
 			);
 		} catch {}
 	}

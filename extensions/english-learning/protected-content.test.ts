@@ -28,6 +28,20 @@ test("does not treat hyphenated words as command-line flags", () => {
 	assert.deepEqual(hardValues, ["--verbose", "-p"]);
 });
 
+test("does not treat ALL-CAPS acronyms as camelCase identifiers", () => {
+	const source = "视觉UI优化，隐藏款解锁弹窗下面的额外奖励相当当前位置往下移动10pt";
+	assert.deepEqual(collectProtectedContentRanges(source, true), []);
+	assert.ok(inputReviewTarget(source));
+
+	const mixed = "用 UIKit 和 getUserName 处理 API 请求";
+	assert.deepEqual(
+		collectProtectedContentRanges(mixed, false)
+			.filter((range) => range.kind === "hard")
+			.map((range) => range.value),
+		["UIKit", "getUserName"],
+	);
+});
+
 test("protects whole project-relative paths and leaves trailing Chinese free", () => {
 	const source = "src/components/squareBrowseTaskTimer/index.jsx\n我是";
 	const hardValues = collectProtectedContentRanges(source, true)
@@ -81,6 +95,46 @@ test("keeps reviewed task command rebuilding for mixed quoted input", () => {
 			target.rebuild('Fix the error: “用户不存在”'),
 			`/${command} Fix the error: “用户不存在”`,
 		);
+	}
+});
+
+test("live recommendations keep mixed Chinese with ALL-CAPS acronyms fully translatable", async () => {
+	const originalFetch = globalThis.fetch;
+	const originalApiKey = process.env.DEEPSEEK_PI_TRANSLATE_API_KEY;
+	process.env.DEEPSEEK_PI_TRANSLATE_API_KEY = "test-key";
+	globalThis.fetch = async (_input, init) => {
+		const body = JSON.parse(String(init?.body)) as { input: string };
+		assert.equal(body.input.includes("视觉UI优化"), true);
+		assert.equal((body.input.match(/⟪PI_TRANSLATION_KEEP_\d+⟫/g) ?? []).length, 0);
+		return new Response(
+			JSON.stringify({
+				status: "completed",
+				output: [
+					{
+						type: "message",
+						content: [
+							{
+								type: "output_text",
+								text: "Visual UI polish: move the extra rewards under the hidden-style unlock popup down by 10pt from the current position",
+							},
+						],
+					},
+				],
+			}),
+			{ status: 200, headers: { "Content-Type": "application/json" } },
+		);
+	};
+
+	try {
+		const source = "视觉UI优化，隐藏款解锁弹窗下面的额外奖励相当当前位置往下移动10pt";
+		assert.equal(
+			await recommendEnglishWithDeepSeek(source),
+			"Visual UI polish: move the extra rewards under the hidden-style unlock popup down by 10pt from the current position",
+		);
+	} finally {
+		globalThis.fetch = originalFetch;
+		if (originalApiKey === undefined) delete process.env.DEEPSEEK_PI_TRANSLATE_API_KEY;
+		else process.env.DEEPSEEK_PI_TRANSLATE_API_KEY = originalApiKey;
 	}
 });
 

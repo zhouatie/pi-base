@@ -30,7 +30,10 @@ export class LivePreviewComponent {
 			lines.push(truncateToWidth(`   ${this.theme.fg("dim", "…")}`, width));
 		}
 		lines.push(
-			truncateToWidth(`   ${this.theme.fg("dim", "Ctrl+Enter send recommendation")}`, width),
+			truncateToWidth(
+				`   ${this.theme.fg("dim", "Ctrl+Enter send  ·  edit text to clear")}`,
+				width,
+			),
 		);
 		return lines;
 	}

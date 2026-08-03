@@ -51,7 +51,9 @@ const HARD_PROTECTED_PATTERNS = [
 	/^[ \t]*\$[ \t]+[^\r\n]+/gm,
 	/(?<![\p{L}\p{N}_-])--?[A-Za-z0-9][A-Za-z0-9-]*/gu,
 	/\b[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+\b/g,
-	/\b[A-Za-z]+(?:[A-Z][A-Za-z0-9]*)+\b/g,
+	// camelCase / PascalCase with at least one lowercase letter.
+	// Skip ALL-CAPS acronyms like UI/API so mixed Chinese text keeps a free-form translation surface.
+	/\b(?=[A-Za-z0-9]*[a-z])[A-Za-z]+(?:[A-Z][A-Za-z0-9]*)+\b/g,
 ];
 
 function isEscaped(source: string, index: number): boolean {

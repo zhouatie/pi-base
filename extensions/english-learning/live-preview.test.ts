@@ -39,12 +39,11 @@ test("returns only a ready recommendation for the current draft", () => {
 	);
 });
 
-test("debounces input and recommends only the latest draft", async () => {
+test("does not auto-translate on text updates", async () => {
 	const calls: string[] = [];
 	const states: LivePreviewState[] = [];
 	const preview = new LivePreviewController({
 		enabled: true,
-		debounceMs: 10,
 		target,
 		recommend: async (source) => {
 			calls.push(source);
@@ -55,7 +54,29 @@ test("debounces input and recommends only the latest draft", async () => {
 
 	preview.update("first");
 	preview.update("second");
-	await delay(40);
+	await delay(20);
+
+	assert.deepEqual(calls, []);
+	assert.deepEqual(states, []);
+	preview.dispose();
+});
+
+test("manual request translates only the requested draft", async () => {
+	const calls: string[] = [];
+	const states: LivePreviewState[] = [];
+	const preview = new LivePreviewController({
+		enabled: true,
+		target,
+		recommend: async (source) => {
+			calls.push(source);
+			return `Recommended ${source}`;
+		},
+		onStateChange: (state) => states.push(state),
+	});
+
+	preview.update("first");
+	assert.equal(preview.request("second"), true);
+	await delay(20);
 
 	assert.deepEqual(calls, ["second"]);
 	assert.deepEqual(states.at(-1), {
@@ -66,13 +87,30 @@ test("debounces input and recommends only the latest draft", async () => {
 	preview.dispose();
 });
 
-test("disabling live preview aborts active work without affecting later drafts", async () => {
-	let aborted = false;
-	let calls = 0;
+test("editing after a recommendation hides the stale preview", async () => {
 	const states: LivePreviewState[] = [];
 	const preview = new LivePreviewController({
 		enabled: true,
-		debounceMs: 5,
+		target,
+		recommend: async (source) => `Recommended ${source}`,
+		onStateChange: (state) => states.push(state),
+	});
+
+	assert.equal(preview.request("draft"), true);
+	await delay(20);
+	preview.update("draft changed");
+
+	assert.deepEqual(states.at(-1), { status: "hidden" });
+	preview.dispose();
+});
+
+test("disabling preview aborts active work", async () => {
+	let aborted = false;
+	let calls = 0;
+	const states: LivePreviewState[] = [];
+	const errors: string[] = [];
+	const preview = new LivePreviewController({
+		enabled: true,
 		target,
 		recommend: (_source, signal) => {
 			calls++;
@@ -88,16 +126,36 @@ test("disabling live preview aborts active work without affecting later drafts",
 			});
 		},
 		onStateChange: (state) => states.push(state),
+		onError: (message) => errors.push(message),
 	});
 
-	preview.update("active");
-	await delay(20);
+	assert.equal(preview.request("active"), true);
+	await delay(5);
 	preview.setEnabled(false);
-	preview.update("disabled draft");
-	await delay(20);
+	await delay(10);
 
 	assert.equal(calls, 1);
 	assert.equal(aborted, true);
 	assert.deepEqual(states.at(-1), { status: "hidden" });
+	assert.deepEqual(errors, []);
+	preview.dispose();
+});
+
+test("reports request failures through onError", async () => {
+	const errors: string[] = [];
+	const preview = new LivePreviewController({
+		enabled: true,
+		target,
+		recommend: async () => {
+			throw new Error("DeepSeek unavailable");
+		},
+		onStateChange: () => {},
+		onError: (message) => errors.push(message),
+	});
+
+	assert.equal(preview.request("draft"), true);
+	await delay(20);
+
+	assert.deepEqual(errors, ["DeepSeek unavailable"]);
 	preview.dispose();
 });

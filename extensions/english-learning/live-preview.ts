@@ -15,10 +15,10 @@ export function currentLiveRecommendation(
 
 type LivePreviewControllerOptions = {
 	enabled: boolean;
-	debounceMs: number;
 	target: (text: string) => InputReviewTarget | undefined;
 	recommend: (source: string, signal: AbortSignal) => Promise<string>;
 	onStateChange: (state: LivePreviewState) => void;
+	onError?: (message: string) => void;
 };
 
 export class LivePreviewController {
@@ -27,26 +27,58 @@ export class LivePreviewController {
 	private currentText = "";
 	private hasCurrentText = false;
 	private generation = 0;
-	private debounceTimer: ReturnType<typeof setTimeout> | undefined;
 	private requestController: AbortController | undefined;
 	private disposed = false;
+	private state: LivePreviewState = { status: "hidden" };
 
 	constructor(options: LivePreviewControllerOptions) {
 		this.options = options;
 		this.enabled = options.enabled;
 	}
 
+	/** Track editor text. Never auto-translates; only invalidates a stale preview. */
 	update(text: string): void {
-		if (this.disposed || (this.hasCurrentText && text === this.currentText)) return;
+		if (this.disposed) return;
+		if (this.hasCurrentText && text === this.currentText) return;
 		this.currentText = text;
 		this.hasCurrentText = true;
-		this.restart();
+		this.invalidateIfStale();
+	}
+
+	/**
+	 * Manually request an English recommendation for the given text.
+	 * Returns false when preview is unavailable or the draft has nothing to translate.
+	 */
+	request(text: string): boolean {
+		if (this.disposed || !this.enabled) return false;
+
+		this.currentText = text;
+		this.hasCurrentText = true;
+
+		const target = this.options.target(text);
+		if (!target) {
+			this.cancelPendingWork();
+			this.setState({ status: "hidden" });
+			return false;
+		}
+
+		if (this.state.status === "ready" && this.state.original === text) return true;
+		if (this.state.status === "loading" && this.state.original === text) return true;
+
+		const generation = this.cancelPendingWork();
+		void this.requestRecommendation(text, target, generation);
+		return true;
 	}
 
 	setEnabled(enabled: boolean): void {
 		if (this.disposed || enabled === this.enabled) return;
 		this.enabled = enabled;
-		this.restart();
+		if (!enabled) {
+			this.cancelPendingWork();
+			this.setState({ status: "hidden" });
+			return;
+		}
+		this.invalidateIfStale();
 	}
 
 	dispose(): void {
@@ -55,30 +87,23 @@ export class LivePreviewController {
 		this.cancelPendingWork();
 	}
 
+	private setState(state: LivePreviewState): void {
+		this.state = state;
+		this.options.onStateChange(state);
+	}
+
+	private invalidateIfStale(): void {
+		if (this.state.status === "hidden") return;
+		if (this.state.original === this.currentText && this.enabled) return;
+		this.cancelPendingWork();
+		this.setState({ status: "hidden" });
+	}
+
 	private cancelPendingWork(): number {
 		const generation = ++this.generation;
-		if (this.debounceTimer) {
-			clearTimeout(this.debounceTimer);
-			this.debounceTimer = undefined;
-		}
 		this.requestController?.abort();
 		this.requestController = undefined;
 		return generation;
-	}
-
-	private restart(): void {
-		const generation = this.cancelPendingWork();
-		this.options.onStateChange({ status: "hidden" });
-		if (!this.enabled || !this.hasCurrentText) return;
-
-		const target = this.options.target(this.currentText);
-		if (!target) return;
-
-		const original = this.currentText;
-		this.debounceTimer = setTimeout(() => {
-			this.debounceTimer = undefined;
-			void this.requestRecommendation(original, target, generation);
-		}, this.options.debounceMs);
 	}
 
 	private async requestRecommendation(
@@ -90,7 +115,7 @@ export class LivePreviewController {
 
 		const controller = new AbortController();
 		this.requestController = controller;
-		this.options.onStateChange({ status: "loading", original });
+		this.setState({ status: "loading", original });
 
 		try {
 			const english = await this.options.recommend(target.source, controller.signal);
@@ -99,16 +124,19 @@ export class LivePreviewController {
 				controller.signal.aborted ||
 				generation !== this.generation ||
 				!this.enabled
-			) return;
-			this.options.onStateChange({
+			) {
+				return;
+			}
+			this.setState({
 				status: "ready",
 				original,
 				recommended: target.rebuild(english),
 			});
-		} catch {
-			if (!this.disposed && !controller.signal.aborted && generation === this.generation) {
-				this.options.onStateChange({ status: "hidden" });
-			}
+		} catch (error) {
+			if (this.disposed || controller.signal.aborted || generation !== this.generation) return;
+			this.setState({ status: "hidden" });
+			const reason = error instanceof Error ? error.message : "Unknown DeepSeek error.";
+			this.options.onError?.(reason);
 		} finally {
 			if (this.requestController === controller) this.requestController = undefined;
 		}

@@ -1,15 +1,18 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { visibleRecommendationLines } from "./live-preview-layout.ts";
 import { highlightReviewDiff } from "./review-ui.ts";
 
-const MAX_RECOMMENDATION_LINES = 4;
-
 export class LivePreviewComponent {
-	constructor(
-		private readonly original: string,
-		private readonly recommended: string | undefined,
-		private readonly theme: Theme,
-	) {}
+	private readonly original: string;
+	private readonly recommended: string | undefined;
+	private readonly theme: Theme;
+
+	constructor(original: string, recommended: string | undefined, theme: Theme) {
+		this.original = original;
+		this.recommended = recommended;
+		this.theme = theme;
+	}
 
 	render(width: number): string[] {
 		if (width <= 0) return [];
@@ -23,15 +26,14 @@ export class LivePreviewComponent {
 		const wrapped = styled
 			.split("\n")
 			.flatMap((line) => wrapTextWithAnsi(line || " ", contentWidth));
-		const visible = wrapped.slice(0, MAX_RECOMMENDATION_LINES);
+
 		const lines = [truncateToWidth(` ${title}`, width)];
-		for (const line of visible) lines.push(truncateToWidth(`   ${line}`, width));
-		if (wrapped.length > MAX_RECOMMENDATION_LINES) {
-			lines.push(truncateToWidth(`   ${this.theme.fg("dim", "…")}`, width));
+		for (const line of visibleRecommendationLines(wrapped, this.theme.fg("dim", "…"))) {
+			lines.push(truncateToWidth(`   ${line}`, width));
 		}
 		lines.push(
 			truncateToWidth(
-				`   ${this.theme.fg("dim", "Ctrl+Enter send  ·  edit text to clear")}`,
+				`   ${this.theme.fg("dim", "Ctrl+Enter send full text  ·  edit text to clear")}`,
 				width,
 			),
 		);

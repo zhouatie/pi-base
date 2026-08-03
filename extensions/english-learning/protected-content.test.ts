@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { inputReviewTarget } from "./input-review.ts";
+import { inputReviewTarget, isSlashCommandInput } from "./input-review.ts";
 import { collectProtectedContentRanges, textOutsideProtectedContent } from "./protected-content.ts";
 import { recommendEnglishWithDeepSeek, reviewEnglishWithDeepSeek } from "./translator.ts";
 
@@ -26,6 +26,19 @@ test("does not treat hyphenated words as command-line flags", () => {
 		.map((range) => range.value);
 
 	assert.deepEqual(hardValues, ["--verbose", "-p"]);
+});
+
+test("treats Pi slash-commands specially but allows absolute image paths", () => {
+	const draft =
+		"/var/folders/jv/x/T/pi-clipboard-8f8d.png\n帮我解决这个 lint问题";
+	assert.equal(isSlashCommandInput(draft), false);
+	assert.ok(inputReviewTarget(draft));
+
+	assert.equal(isSlashCommandInput("/trans preview"), true);
+	assert.equal(inputReviewTarget("/trans preview"), undefined);
+
+	assert.equal(isSlashCommandInput("/oracle 修复报错"), true);
+	assert.ok(inputReviewTarget("/oracle 修复报错"));
 });
 
 test("does not treat ALL-CAPS acronyms as camelCase identifiers", () => {

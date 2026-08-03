@@ -9,6 +9,12 @@ export type InputReviewTarget = {
 	rebuild: (english: string) => string;
 };
 
+/** True for Pi slash-commands like `/trans`, not absolute paths like `/var/folders/...`. */
+export function isSlashCommandInput(text: string): boolean {
+	const firstLine = text.trimStart().split(/\r?\n/, 1)[0];
+	return /^\/[A-Za-z0-9][A-Za-z0-9:_-]*(?:\s|$)/.test(firstLine);
+}
+
 function hasReviewableContent(text: string): boolean {
 	const trimmed = text.trim();
 	if (!trimmed) return false;
@@ -67,8 +73,7 @@ export function inputReviewTarget(text: string): InputReviewTarget | undefined {
 		};
 	}
 
-	const firstLine = trimmed.split(/\r?\n/, 1)[0];
-	if (/^\/[A-Za-z0-9][A-Za-z0-9:_-]*(?:\s|$)/.test(firstLine)) return undefined;
+	if (isSlashCommandInput(trimmed)) return undefined;
 	if (!hasReviewableContent(text)) return undefined;
 	return { source: text, rebuild: (english) => english.trim() };
 }

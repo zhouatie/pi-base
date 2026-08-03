@@ -10,6 +10,7 @@ import { Container, Key, Markdown, Text } from '@earendil-works/pi-tui';
 import { InputReviewCancellationState } from './input-review-cancellation.ts';
 import {
     inputReviewTarget,
+    isSlashCommandInput,
     normalizeCosmeticEnglish,
     type InputReviewTarget,
 } from './input-review.ts';
@@ -423,7 +424,9 @@ export default function englishLearning(pi: ExtensionAPI) {
             }
 
             const original = ctx.ui.getEditorText();
-            if (original.trimStart().startsWith('/')) {
+            // Block bare slash-commands like `/trans`, but allow absolute paths such as
+            // `/var/folders/.../shot.png` and reviewed task prompts like `/oracle 修复`.
+            if (isSlashCommandInput(original) && !inputReviewTarget(original)) {
                 ctx.ui.notify(
                     'Use Enter to submit commands; English recommendations support text prompts only.',
                     'warning',

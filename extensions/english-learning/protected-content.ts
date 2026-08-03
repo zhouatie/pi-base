@@ -25,14 +25,28 @@ const PAIRED_QUOTES = new Map([
 const SYMMETRIC_QUOTES = new Set(["\"", "'"]);
 const WORD_CHARACTER = /[\p{L}\p{N}]/u;
 
+// Path characters that can appear inside a filesystem/module path token.
+const PATH_TOKEN_CHAR = String.raw`A-Za-z0-9._@%+,\-=`;
+// Do not start a path match in the middle of another path or identifier.
+const PATH_BOUNDARY = String.raw`(?<![${PATH_TOKEN_CHAR}/])`;
+// Relative multi-segment paths such as src/foo/bar.tsx or packages/core/index.
+// Require a file extension or at least three segments to avoid English pairs like and/or.
+const RELATIVE_PATH = String.raw`\b(?:[${PATH_TOKEN_CHAR}]+/){2,}[${PATH_TOKEN_CHAR}]+|\b(?:[${PATH_TOKEN_CHAR}]+/)+[${PATH_TOKEN_CHAR}]+\.[A-Za-z][A-Za-z0-9]{0,15}\b`;
+
 const HARD_PROTECTED_PATTERNS = [
 	/```[\s\S]*?(?:```|$)/g,
 	/~~~[\s\S]*?(?:~~~|$)/g,
 	/(`+)[^\r\n]*?\1/g,
 	/https?:\/\/[^\s<>"']+/g,
-	/(?:\/|\.\.?\/|~\/)[^\r\n<>]*?\.(?:png|jpe?g|gif|webp|bmp)(?=\s|$|["'”’)\]}】》」』,，。；;:：])/gi,
+	new RegExp(
+		String.raw`${PATH_BOUNDARY}(?:\/|\.\.?\/|~\/)[^\r\n<>]*?\.(?:png|jpe?g|gif|webp|bmp)(?=\s|$|["'”’)\]}】》」』,，。；;:：])`,
+		"gi",
+	),
 	/[A-Za-z]:\\[^\r\n<>]*?\.(?:png|jpe?g|gif|webp|bmp)(?=\s|$|["'”’)\]}】》」』,，。；;:：])/gi,
-	/(?:\/|\.\.?\/|~\/)[A-Za-z0-9._@%+,\-=/]+/g,
+	// Absolute or explicit relative paths: /tmp/x, ./src/x, ~/project/x
+	new RegExp(String.raw`${PATH_BOUNDARY}(?:\/|\.\.?\/|~\/)[${PATH_TOKEN_CHAR}/]+`, "g"),
+	// Project-relative paths: src/components/foo/index.jsx
+	new RegExp(RELATIVE_PATH, "g"),
 	/[A-Za-z]:\\(?:[^\s<>:"|?*]+\\)*[^\s<>:"|?*]*/g,
 	/^[ \t]*\$[ \t]+[^\r\n]+/gm,
 	/(?<![\p{L}\p{N}_-])--?[A-Za-z0-9][A-Za-z0-9-]*/gu,

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { inputReviewTarget } from "./input-review.ts";
-import { collectProtectedContentRanges } from "./protected-content.ts";
+import { collectProtectedContentRanges, textOutsideProtectedContent } from "./protected-content.ts";
 import { recommendEnglishWithDeepSeek, reviewEnglishWithDeepSeek } from "./translator.ts";
 
 function quotedValues(source: string): string[] {
@@ -28,6 +28,38 @@ test("does not treat hyphenated words as command-line flags", () => {
 	assert.deepEqual(hardValues, ["--verbose", "-p"]);
 });
 
+test("protects whole project-relative paths and leaves trailing Chinese free", () => {
+	const source = "src/components/squareBrowseTaskTimer/index.jsx\n我是";
+	const hardValues = collectProtectedContentRanges(source, true)
+		.filter((range) => range.kind === "hard")
+		.map((range) => range.value);
+
+	assert.deepEqual(hardValues, ["src/components/squareBrowseTaskTimer/index.jsx"]);
+	assert.equal(
+		textOutsideProtectedContent(source, true).includes("我是"),
+		true,
+	);
+	assert.ok(inputReviewTarget(source));
+});
+
+test("does not treat English slash pairs as paths", () => {
+	const source = "use and/or carefully with I/O";
+	const hardValues = collectProtectedContentRanges(source, false)
+		.filter((range) => range.kind === "hard")
+		.map((range) => range.value);
+
+	assert.deepEqual(hardValues, []);
+});
+
+test("still protects absolute and explicit relative paths as whole tokens", () => {
+	const source = "fix /tmp/file.ts and ./src/main.ts plus ~/project/app.tsx";
+	const hardValues = collectProtectedContentRanges(source, false)
+		.filter((range) => range.kind === "hard")
+		.map((range) => range.value);
+
+	assert.deepEqual(hardValues, ["/tmp/file.ts", "./src/main.ts", "~/project/app.tsx"]);
+});
+
 test("does not hide trailing prose after an unmatched quote opener", () => {
 	const source = "修复 “未闭合 trailing 中文";
 	assert.deepEqual(quotedValues(source), []);
@@ -49,6 +81,44 @@ test("keeps reviewed task command rebuilding for mixed quoted input", () => {
 			target.rebuild('Fix the error: “用户不存在”'),
 			`/${command} Fix the error: “用户不存在”`,
 		);
+	}
+});
+
+test("live recommendations keep relative paths whole and still translate Chinese", async () => {
+	const originalFetch = globalThis.fetch;
+	const originalApiKey = process.env.DEEPSEEK_PI_TRANSLATE_API_KEY;
+	process.env.DEEPSEEK_PI_TRANSLATE_API_KEY = "test-key";
+	globalThis.fetch = async (_input, init) => {
+		const body = JSON.parse(String(init?.body)) as { input: string };
+		const placeholders = body.input.match(/⟪PI_TRANSLATION_KEEP_\d+⟫/g) ?? [];
+		assert.equal(body.input.includes("src/components"), false);
+		assert.equal(body.input.includes("我是"), true);
+		assert.equal(placeholders.length, 1);
+		assert.match(body.input, new RegExp(`${placeholders[0]}\\n我是`));
+		return new Response(
+			JSON.stringify({
+				status: "completed",
+				output: [
+					{
+						type: "message",
+						content: [{ type: "output_text", text: `${placeholders[0]}\nI am` }],
+					},
+				],
+			}),
+			{ status: 200, headers: { "Content-Type": "application/json" } },
+		);
+	};
+
+	try {
+		const source = "src/components/squareBrowseTaskTimer/index.jsx\n我是";
+		assert.equal(
+			await recommendEnglishWithDeepSeek(source),
+			"src/components/squareBrowseTaskTimer/index.jsx\nI am",
+		);
+	} finally {
+		globalThis.fetch = originalFetch;
+		if (originalApiKey === undefined) delete process.env.DEEPSEEK_PI_TRANSLATE_API_KEY;
+		else process.env.DEEPSEEK_PI_TRANSLATE_API_KEY = originalApiKey;
 	}
 });
 

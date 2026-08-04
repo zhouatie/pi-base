@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { inputReviewTarget, isSlashCommandInput } from "./input-review.ts";
 import { collectProtectedContentRanges, textOutsideProtectedContent } from "./protected-content.ts";
-import { recommendEnglishWithDeepSeek, reviewEnglishWithDeepSeek } from "./translator.ts";
+import { recommendEnglishWithDeepSeek, reviewEnglishWithDeepSeek, translateWithDeepSeek } from "./translator.ts";
 
 function quotedValues(source: string): string[] {
 	return collectProtectedContentRanges(source, true)
@@ -218,6 +218,151 @@ test("live recommendations preserve quotes and technical content", async () => {
 			await recommendEnglishWithDeepSeek(source),
 			'Fix “用户不存在” in /tmp/file.ts',
 		);
+	} finally {
+		globalThis.fetch = originalFetch;
+		if (originalApiKey === undefined) delete process.env.DEEPSEEK_PI_TRANSLATE_API_KEY;
+		else process.env.DEEPSEEK_PI_TRANSLATE_API_KEY = originalApiKey;
+	}
+});
+
+test("retries once and succeeds when the first attempt drops a protected placeholder", async () => {
+	const originalFetch = globalThis.fetch;
+	const originalApiKey = process.env.DEEPSEEK_PI_TRANSLATE_API_KEY;
+	process.env.DEEPSEEK_PI_TRANSLATE_API_KEY = "test-key";
+	let requestIndex = 0;
+	globalThis.fetch = async (_input, init) => {
+		const body = JSON.parse(String(init?.body)) as { input: string };
+		const placeholders = body.input.match(/⟪PI_TRANSLATION_KEEP_\d+⟫/g) ?? [];
+		const text =
+			requestIndex++ === 0
+				? "I am" // first attempt drops the placeholder
+				: `${placeholders[0]}\nI am`; // retry keeps it
+		return new Response(
+			JSON.stringify({
+				status: "completed",
+				output: [{ type: "message", content: [{ type: "output_text", text }] }],
+			}),
+			{ status: 200, headers: { "Content-Type": "application/json" } },
+		);
+	};
+
+	try {
+		const source = "src/components/squareBrowseTaskTimer/index.jsx\n我是";
+		assert.equal(
+			await recommendEnglishWithDeepSeek(source),
+			"src/components/squareBrowseTaskTimer/index.jsx\nI am",
+		);
+		assert.equal(requestIndex, 2);
+	} finally {
+		globalThis.fetch = originalFetch;
+		if (originalApiKey === undefined) delete process.env.DEEPSEEK_PI_TRANSLATE_API_KEY;
+		else process.env.DEEPSEEK_PI_TRANSLATE_API_KEY = originalApiKey;
+	}
+});
+
+test("falls back leniently when the retry also drops a placeholder", async () => {
+	const originalFetch = globalThis.fetch;
+	const originalApiKey = process.env.DEEPSEEK_PI_TRANSLATE_API_KEY;
+	process.env.DEEPSEEK_PI_TRANSLATE_API_KEY = "test-key";
+	let requestIndex = 0;
+	globalThis.fetch = async (_input, init) => {
+		const body = JSON.parse(String(init?.body)) as { input: string };
+		assert.equal((body.input.match(/⟪PI_TRANSLATION_KEEP_\d+⟫/g) ?? []).length, 1);
+		requestIndex++;
+		return new Response(
+			JSON.stringify({
+				status: "completed",
+				output: [
+					{
+						type: "message",
+						content: [{ type: "output_text", text: "I am" }],
+					},
+				],
+			}),
+			{ status: 200, headers: { "Content-Type": "application/json" } },
+		);
+	};
+
+	try {
+		const source = "src/components/squareBrowseTaskTimer/index.jsx\n我是";
+		const english = await recommendEnglishWithDeepSeek(source);
+		assert.equal(english, "I am");
+		assert.equal(english.includes("⟪PI_TRANSLATION_KEEP_"), false);
+		assert.equal(requestIndex, 2);
+	} finally {
+		globalThis.fetch = originalFetch;
+		if (originalApiKey === undefined) delete process.env.DEEPSEEK_PI_TRANSLATE_API_KEY;
+		else process.env.DEEPSEEK_PI_TRANSLATE_API_KEY = originalApiKey;
+	}
+});
+
+test("collapses a duplicated placeholder leniently without leaking tokens", async () => {
+	const originalFetch = globalThis.fetch;
+	const originalApiKey = process.env.DEEPSEEK_PI_TRANSLATE_API_KEY;
+	process.env.DEEPSEEK_PI_TRANSLATE_API_KEY = "test-key";
+	globalThis.fetch = async (_input, init) => {
+		const body = JSON.parse(String(init?.body)) as { input: string };
+		const placeholders = body.input.match(/⟪PI_TRANSLATION_KEEP_\d+⟫/g) ?? [];
+		return new Response(
+			JSON.stringify({
+				status: "completed",
+				output: [
+					{
+						type: "message",
+						content: [
+							{ type: "output_text", text: `${placeholders[0]} ${placeholders[0]} more` },
+						],
+					},
+				],
+			}),
+			{ status: 200, headers: { "Content-Type": "application/json" } },
+		);
+	};
+
+	try {
+		const source = "src/components/squareBrowseTaskTimer/index.jsx\n我是";
+		const english = await recommendEnglishWithDeepSeek(source);
+		assert.equal(
+			english,
+			"src/components/squareBrowseTaskTimer/index.jsx src/components/squareBrowseTaskTimer/index.jsx more",
+		);
+		assert.equal(english.includes("⟪PI_TRANSLATION_KEEP_"), false);
+	} finally {
+		globalThis.fetch = originalFetch;
+		if (originalApiKey === undefined) delete process.env.DEEPSEEK_PI_TRANSLATE_API_KEY;
+		else process.env.DEEPSEEK_PI_TRANSLATE_API_KEY = originalApiKey;
+	}
+});
+
+test("reply translation falls back leniently instead of failing on dropped placeholders", async () => {
+	const originalFetch = globalThis.fetch;
+	const originalApiKey = process.env.DEEPSEEK_PI_TRANSLATE_API_KEY;
+	process.env.DEEPSEEK_PI_TRANSLATE_API_KEY = "test-key";
+	let requestIndex = 0;
+	globalThis.fetch = async (_input, init) => {
+		const body = JSON.parse(String(init?.body)) as { input: string };
+		assert.equal((body.input.match(/⟪PI_TRANSLATION_KEEP_\d+⟫/g) ?? []).length, 1);
+		requestIndex++;
+		return new Response(
+			JSON.stringify({
+				status: "completed",
+				output: [
+					{
+						type: "message",
+						content: [{ type: "output_text", text: "修复了崩溃" }],
+					},
+				],
+			}),
+			{ status: 200, headers: { "Content-Type": "application/json" } },
+		);
+	};
+
+	try {
+		const source = "Fixed the crash in src/components/squareBrowseTaskTimer/index.jsx";
+		const translated = await translateWithDeepSeek(source, "en-zh");
+		assert.equal(translated, "修复了崩溃");
+		assert.equal(translated.includes("⟪PI_TRANSLATION_KEEP_"), false);
+		assert.equal(requestIndex, 2);
 	} finally {
 		globalThis.fetch = originalFetch;
 		if (originalApiKey === undefined) delete process.env.DEEPSEEK_PI_TRANSLATE_API_KEY;

@@ -5,6 +5,7 @@ const DEEPSEEK_MODEL = "deepseek-v4-flash";
 const REQUEST_TIMEOUT_MS = 60_000;
 const PLACEHOLDER_PREFIX = "⟪PI_TRANSLATION_KEEP_";
 const PLACEHOLDER_PATTERN = /⟪PI_TRANSLATION_KEEP_\d+⟫/g;
+const PLACEHOLDER_MISMATCH_MESSAGE = "Translation placeholders were changed.";
 
 type TranslationDirection = "zh-en" | "en-zh";
 
@@ -56,25 +57,39 @@ function countOccurrences(text: string, value: string): number {
 	return count;
 }
 
-function restoreProtectedText(translated: string, protectedText: ProtectedText): string {
+function restoreProtectedText(
+	translated: string,
+	protectedText: ProtectedText,
+	strict = true,
+): string {
 	const expected = new Set(protectedText.segments.map(({ placeholder }) => placeholder));
 	const returned = translated.match(PLACEHOLDER_PATTERN) ?? [];
 
-	if (returned.length !== expected.size || returned.some((placeholder) => !expected.has(placeholder))) {
-		throw new Error("Translation placeholders were changed.");
+	if (
+		strict &&
+		(returned.length !== expected.size ||
+			returned.some((placeholder) => !expected.has(placeholder)))
+	) {
+		throw new Error(PLACEHOLDER_MISMATCH_MESSAGE);
 	}
 
 	let restored = translated;
 	for (const { placeholder, value } of protectedText.segments) {
-		if (countOccurrences(restored, placeholder) !== 1) {
-			throw new Error("Translation placeholders were changed.");
+		const occurrences = countOccurrences(restored, placeholder);
+		if (strict && occurrences !== 1) {
+			throw new Error(PLACEHOLDER_MISMATCH_MESSAGE);
 		}
-		restored = restored.replace(placeholder, value);
+		if (occurrences > 0) restored = restored.split(placeholder).join(value);
 	}
-	if (restored.includes(PLACEHOLDER_PREFIX)) {
+	if (strict && restored.includes(PLACEHOLDER_PREFIX)) {
 		throw new Error("Translation contains an unexpected protected placeholder.");
 	}
-	return restored;
+	// A lenient fallback must never leak a placeholder token into the final output.
+	return restored.replace(PLACEHOLDER_PATTERN, "");
+}
+
+function isPlaceholderMismatch(error: unknown): boolean {
+	return error instanceof Error && error.message === PLACEHOLDER_MISMATCH_MESSAGE;
 }
 
 function translationInstruction(direction: TranslationDirection): string {
@@ -190,6 +205,29 @@ async function completeWithDeepSeek(
 	}
 }
 
+async function completeAndRestore(
+	instruction: string,
+	protectedText: ProtectedText,
+	signal: AbortSignal | undefined,
+	jsonOutput: boolean,
+): Promise<string> {
+	let content = await completeWithDeepSeek(
+		instruction,
+		protectedText.text,
+		signal,
+		jsonOutput,
+	);
+	try {
+		return restoreProtectedText(content, protectedText);
+	} catch (error) {
+		if (!isPlaceholderMismatch(error)) throw error;
+	}
+	// Fast models occasionally drop or merge immutable placeholder tokens. Retry once;
+	// if it still fails, restore leniently so the user still gets a usable result.
+	content = await completeWithDeepSeek(instruction, protectedText.text, signal, jsonOutput);
+	return restoreProtectedText(content, protectedText, false);
+}
+
 function readObjectString(record: Record<string, unknown>, keys: string[]): string | undefined {
 	for (const key of keys) {
 		const value = record[key];
@@ -278,13 +316,12 @@ export async function translateWithDeepSeek(
 	signal?: AbortSignal,
 ): Promise<string> {
 	const protectedText = protectText(source);
-	const content = await completeWithDeepSeek(
+	return completeAndRestore(
 		translationInstruction(direction),
-		protectedText.text,
+		protectedText,
 		signal,
 		false,
 	);
-	return restoreProtectedText(content, protectedText);
 }
 
 export async function recommendEnglishWithDeepSeek(
@@ -293,13 +330,14 @@ export async function recommendEnglishWithDeepSeek(
 	preserveQuotedContent = true,
 ): Promise<string> {
 	const protectedText = protectText(source, preserveQuotedContent);
-	const content = await completeWithDeepSeek(
-		recommendationInstruction(),
-		protectedText.text,
-		signal,
-		false,
-	);
-	return restoreProtectedText(content, protectedText).trim();
+	return (
+		await completeAndRestore(
+			recommendationInstruction(),
+			protectedText,
+			signal,
+			false,
+		)
+	).trim();
 }
 
 export async function reviewEnglishWithDeepSeek(

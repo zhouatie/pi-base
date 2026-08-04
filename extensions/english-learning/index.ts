@@ -415,14 +415,6 @@ export default function englishLearning(pi: ExtensionAPI) {
                 return;
             }
 
-            if (!ctx.isIdle()) {
-                ctx.ui.notify(
-                    'Wait for the Agent to finish before using English recommendations.',
-                    'warning',
-                );
-                return;
-            }
-
             const original = ctx.ui.getEditorText();
             // Block bare slash-commands like `/trans`, but allow absolute paths such as
             // `/var/folders/.../shot.png` and reviewed task prompts like `/oracle 修复`.
@@ -471,7 +463,24 @@ export default function englishLearning(pi: ExtensionAPI) {
             };
             pendingPreviewSend = pending;
             try {
-                pi.sendUserMessage(recommended);
+                if (ctx.isIdle()) {
+                    pi.sendUserMessage(recommended);
+                } else {
+                    // The agent is still running: queue the recommendation as a
+                    // follow-up so it is delivered once the agent finishes, and
+                    // keep the pending marker alive until then so the editor is
+                    // still cleared when the queued message actually starts.
+                    clearTimeout(pending.expires);
+                    pending.expires = setTimeout(() => {
+                        if (pendingPreviewSend === pending)
+                            pendingPreviewSend = undefined;
+                    }, 60_000);
+                    ctx.ui.notify(
+                        'The recommendation will be sent after the agent finishes.',
+                        'info',
+                    );
+                    pi.sendUserMessage(recommended, { deliverAs: 'followUp' });
+                }
             } catch (error) {
                 clearPendingPreviewSend();
                 const reason =
@@ -754,13 +763,17 @@ export default function englishLearning(pi: ExtensionAPI) {
                 };
                 renderTranslationWidget(ctx, translated);
                 translationVisible = true;
-            } catch {
+            } catch (error) {
                 if (
                     generation === inputReviewCancellation.generation &&
                     !controller.signal.aborted
                 ) {
+                    const reason =
+                        error instanceof Error
+                            ? `（${error.message}）`
+                            : '';
                     ctx.ui.notify(
-                        '回复翻译失败。请检查 DEEPSEEK_PI_TRANSLATE_API_KEY 或稍后重试。',
+                        `回复翻译失败${reason}。请检查 DEEPSEEK_PI_TRANSLATE_API_KEY 或稍后重试。`,
                         'error',
                     );
                 }

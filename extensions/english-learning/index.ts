@@ -395,7 +395,7 @@ export default function englishLearning(pi: ExtensionAPI) {
         },
     });
 
-    pi.registerShortcut(Key.ctrlShift('e'), {
+    pi.registerShortcut(Key.ctrlShift('m'), {
         description: 'Cycle the English translation mode',
         handler: async (ctx) => {
             setTranslationMode(nextTranslationMode(translationMode), ctx);
